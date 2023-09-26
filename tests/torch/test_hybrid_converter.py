@@ -6,13 +6,14 @@ from typing import List, Union
 
 import pytest
 import torch
-from concrete.fhe import Configuration, ParameterSelectionStrategy
+from concrete.fhe import Configuration
 from transformers import GPT2LMHeadModel, GPT2Tokenizer
 
+from concrete.ml.pytest.torch_models import PartialQATModel
 from concrete.ml.torch.hybrid_model import HybridFHEModel
 
 
-def run_hybrid_model_test(
+def run_hybrid_llm_test(
     model: torch.nn.Module, inputs: torch.Tensor, module_names: Union[str, List], expected_accuracy
 ):
     """Run the test for any model with its private module names."""
@@ -20,7 +21,6 @@ def run_hybrid_model_test(
     # Multi-parameter strategy is used in order to speed-up the FHE executions
     configuration = Configuration(
         single_precision=False,
-        parameter_selection_strategy=ParameterSelectionStrategy.MULTI,
     )
 
     # Create a hybrid model
@@ -67,6 +67,7 @@ def run_hybrid_model_test(
 
         # Get the temp directory path
         hybrid_model.save_and_clear_private_info(temp_dir_path)
+        hybrid_model.set_fhe_mode("remote")
         # At this point, the hybrid model does not have
         # the parameters necessaryto run the module_names
 
@@ -100,7 +101,29 @@ def test_gpt2_hybrid_mlp(list_or_str_private_modules_names, expected_accuracy):
     input_ids = tokenizer.encode(prompt, return_tensors="pt")
 
     # Run the test with using a single module in FHE
-    run_hybrid_model_test(model, input_ids, list_or_str_private_modules_names, expected_accuracy)
+    assert isinstance(model, torch.nn.Module)
+    run_hybrid_llm_test(model, input_ids, list_or_str_private_modules_names, expected_accuracy)
+
+
+def test_hybrid_brevitas_qat_model():
+    """Test GPT2 hybrid."""
+    n_bits = 3
+    input_shape = 32
+    output_shape = 4
+    dataset_size = 100
+
+    model = PartialQATModel(input_shape, output_shape, n_bits)
+    inputs = torch.randn(
+        (
+            dataset_size,
+            input_shape,
+        )
+    )
+    # Run the test with using a single module in FHE
+    model(inputs)
+    assert isinstance(model, torch.nn.Module)
+    hybrid_model = HybridFHEModel(model, module_names="sub_module")
+    hybrid_model.compile_model(x=inputs)
 
 
 def test_gpt2_hybrid_mlp_module_not_found():

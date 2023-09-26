@@ -2,7 +2,7 @@
 import copy
 import re
 from functools import partial
-from typing import Any, Dict, Generator, Iterable, List, Optional, TextIO, Tuple, Union
+from typing import Any, Dict, Generator, Iterable, List, Optional, Sequence, TextIO, Tuple, Union
 
 import numpy
 import onnx
@@ -24,7 +24,6 @@ from ..common.utils import (
     check_there_is_no_p_error_options_in_configuration,
     generate_proxy_function,
     manage_parameters_for_pbs_errors,
-    set_multi_parameter_in_configuration,
     to_tuple,
 )
 from .base_quantized_op import ONNXOpInputOutputType, QuantizedOp
@@ -577,6 +576,7 @@ class QuantizedModule:
         p_error: Optional[float] = None,
         global_p_error: Optional[float] = None,
         verbose: bool = False,
+        inputs_encryption_status: Optional[Sequence[str]] = None,
     ) -> Circuit:
         """Compile the module's forward function.
 
@@ -598,9 +598,15 @@ class QuantizedModule:
                 error to a default value.
             verbose (bool): Indicate if compilation information should be printed
                 during compilation. Default to False.
+            inputs_encryption_status (Optional[Sequence[str]]): encryption status ('clear',
+                'encrypted') for each input.
 
         Returns:
             Circuit: The compiled Circuit.
+
+        Raises:
+            ValueError: if inputs_encryption_status does not match with the
+                parameters of the quantized module
         """
         inputs = to_tuple(inputs)
 
@@ -621,9 +627,39 @@ class QuantizedModule:
             self._clear_forward, self.ordered_module_input_names
         )
 
+        if inputs_encryption_status is None:
+            inputs_encryption_status = tuple(
+                "encrypted" for _ in orig_args_to_proxy_func_args.values()
+            )
+        else:
+            if len(inputs_encryption_status) < len(orig_args_to_proxy_func_args.values()):
+                raise ValueError(
+                    f"Missing arguments from '{inputs_encryption_status}', expected "
+                    f"{len(orig_args_to_proxy_func_args.values())} arguments."
+                )
+            if len(inputs_encryption_status) > len(orig_args_to_proxy_func_args.values()):
+                raise ValueError(
+                    f"Too many arguments in '{inputs_encryption_status}', expected "
+                    f"{len(orig_args_to_proxy_func_args.values())} arguments."
+                )
+            if not all(value in {"clear", "encrypted"} for value in inputs_encryption_status):
+                raise ValueError(
+                    f"Unexpected status from '{inputs_encryption_status}',"
+                    " expected 'clear' or 'encrypted'."
+                )
+            if not any(value == "encrypted" for value in inputs_encryption_status):
+                raise ValueError(
+                    f"At least one input should be encrypted but got {inputs_encryption_status}"
+                )
+
+        assert inputs_encryption_status is not None  # For mypy
+        inputs_encryption_status_dict = dict(
+            zip(orig_args_to_proxy_func_args.values(), inputs_encryption_status)
+        )
+
         compiler = Compiler(
             forward_proxy,
-            {arg_name: "encrypted" for arg_name in orig_args_to_proxy_func_args.values()},
+            parameter_encryption_statuses=inputs_encryption_status_dict,
         )
 
         # Quantize the inputs
@@ -638,11 +674,6 @@ class QuantizedModule:
 
         # Find the right way to set parameters for compiler, depending on the way we want to default
         p_error, global_p_error = manage_parameters_for_pbs_errors(p_error, global_p_error)
-
-        # Remove this function once the default strategy is set to multi-parameter in Concrete
-        # Python
-        # TODO: https://github.com/zama-ai/concrete-ml-internal/issues/3860
-        configuration = set_multi_parameter_in_configuration(configuration)
 
         # Jit compiler is now deprecated and will soon be removed, it is thus forced to False
         # by default
