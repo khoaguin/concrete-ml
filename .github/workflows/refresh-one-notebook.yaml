@@ -6,7 +6,6 @@ on:
         # --- refresh_notebooks_list.py: refresh list of notebooks currently available [START] ---
         # --- do not edit, auto generated part by `make refresh_notebooks_list` ---
         description: "Notebook file name only in: \n
-        - Cifar10 \n
         - CifarInFhe \n
         - CifarInFheWithSmallerAccumulators \n
         - CifarQuantizationAwareTraining \n
@@ -16,17 +15,20 @@ on:
         - CreditScoring \n
         - DecisionTreeClassifier \n
         - DecisionTreeRegressor \n
-        - Deployment \n
+        - EncryptedPandas \n
         - ExperimentPrivacyTreePaper \n
         - FromImageNetToCifar \n
         - FullyConnectedNeuralNetwork \n
         - FullyConnectedNeuralNetworkOnMNIST \n
         - GLMComparison \n
         - HealthCarePrediction \n
+        - ImportingFromScikitLearn \n
         - KaggleTitanic \n
+        - KNearestNeighbors \n
         - LinearRegression \n
         - LinearSVR \n
         - LogisticRegression \n
+        - LogisticRegressionTraining \n
         - PerrorImpactOnFMNIST \n
         - PoissonRegression \n
         - QGPT2Evaluate \n
@@ -35,6 +37,7 @@ on:
         - RegressorComparison \n
         - SentimentClassification \n
         - SVMClassifier \n
+        - WhitePaperExperiments \n
         - XGBClassifier \n
         - XGBRegressor \n
         "
@@ -42,14 +45,13 @@ on:
         required: true
 
 concurrency:
-  group: ${{ github.ref }}
+  group: "${{ github.ref }}-${{ github.event_name }}-${{ github.workflow }}-${{ github.event.inputs.notebook }}"
   cancel-in-progress: false
 
 env:
   ACTION_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
   # --- refresh_notebooks_list.py: refresh list of notebook paths currently available [START] ---
   # --- do not edit, auto generated part by `make refresh_notebooks_list` ---
-  Cifar10: "use_case_examples/cifar/cifar_brevitas_with_model_splitting/Cifar10.ipynb" 
   CifarInFhe: "use_case_examples/cifar/cifar_brevitas_finetuning/CifarInFhe.ipynb" 
   CifarInFheWithSmallerAccumulators: "use_case_examples/cifar/cifar_brevitas_finetuning/CifarInFheWithSmallerAccumulators.ipynb" 
   CifarQuantizationAwareTraining: "use_case_examples/cifar/cifar_brevitas_finetuning/CifarQuantizationAwareTraining.ipynb" 
@@ -59,17 +61,20 @@ env:
   CreditScoring: "use_case_examples/credit_scoring/CreditScoring.ipynb" 
   DecisionTreeClassifier: "docs/advanced_examples/DecisionTreeClassifier.ipynb" 
   DecisionTreeRegressor: "docs/advanced_examples/DecisionTreeRegressor.ipynb" 
-  Deployment: "docs/advanced_examples/Deployment.ipynb" 
+  EncryptedPandas: "docs/advanced_examples/EncryptedPandas.ipynb" 
   ExperimentPrivacyTreePaper: "docs/advanced_examples/ExperimentPrivacyTreePaper.ipynb" 
   FromImageNetToCifar: "use_case_examples/cifar/cifar_brevitas_finetuning/FromImageNetToCifar.ipynb" 
   FullyConnectedNeuralNetwork: "docs/advanced_examples/FullyConnectedNeuralNetwork.ipynb" 
   FullyConnectedNeuralNetworkOnMNIST: "docs/advanced_examples/FullyConnectedNeuralNetworkOnMNIST.ipynb" 
   GLMComparison: "docs/advanced_examples/GLMComparison.ipynb" 
   HealthCarePrediction: "use_case_examples/disease_prediction/HealthCarePrediction.ipynb" 
+  ImportingFromScikitLearn: "docs/advanced_examples/ImportingFromScikitLearn.ipynb" 
   KaggleTitanic: "use_case_examples/titanic/KaggleTitanic.ipynb" 
+  KNearestNeighbors: "docs/advanced_examples/KNearestNeighbors.ipynb" 
   LinearRegression: "docs/advanced_examples/LinearRegression.ipynb" 
   LinearSVR: "docs/advanced_examples/LinearSVR.ipynb" 
   LogisticRegression: "docs/advanced_examples/LogisticRegression.ipynb" 
+  LogisticRegressionTraining: "docs/advanced_examples/LogisticRegressionTraining.ipynb" 
   PerrorImpactOnFMNIST: "use_case_examples/cifar/cifar_brevitas_finetuning/PerrorImpactOnFMNIST.ipynb" 
   PoissonRegression: "docs/advanced_examples/PoissonRegression.ipynb" 
   QGPT2Evaluate: "use_case_examples/llm/QGPT2Evaluate.ipynb" 
@@ -78,6 +83,7 @@ env:
   RegressorComparison: "docs/advanced_examples/RegressorComparison.ipynb" 
   SentimentClassification: "use_case_examples/sentiment_analysis_with_transformer/SentimentClassification.ipynb" 
   SVMClassifier: "docs/advanced_examples/SVMClassifier.ipynb" 
+  WhitePaperExperiments: "use_case_examples/white_paper_experiment/WhitePaperExperiments.ipynb" 
   XGBClassifier: "docs/advanced_examples/XGBClassifier.ipynb" 
   XGBRegressor: "docs/advanced_examples/XGBRegressor.ipynb" 
   # --- refresh_notebooks_list.py: refresh list of notebook paths currently available [END] ---
@@ -91,10 +97,10 @@ jobs:
       ec2-instance-id-38: ${{ steps.start-ec2-runner-38.outputs.ec2-instance-id || '' }}
     steps:
       - name: Checkout Code
-        uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@8c3f20df09ac63af7b3ae3d7c91f105f857d8497
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -102,7 +108,7 @@ jobs:
 
       - name: Start EC2 runner python 38
         id: start-ec2-runner-38
-        uses: machulav/ec2-github-runner@4e0303de215db88e1c489e07a15ca4d867f488ea
+        uses: machulav/ec2-github-runner@fcfb31a5760dad1314a64a0e172b78ec6fc8a17e
         with:
           mode: start
           github-token: ${{ secrets.EC2_RUNNER_BOT_TOKEN }}
@@ -145,13 +151,13 @@ jobs:
           apt update && apt install git git-lfs -y
 
       - name: Checkout Code
-        uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
         with:
           token: ${{ secrets.BOT_TOKEN }}
           lfs: true
 
       - name: 'Set up Python 3.8'
-        uses: actions/setup-python@61a6322f88396a6271a6ee3565807d608ecaddd1
+        uses: actions/setup-python@82c7e631bb3cdc910f68e0081d67478d79c6982d
         with:
           python-version: '3.8'
 
@@ -172,7 +178,7 @@ jobs:
           source .venv/bin/activate
           cd ./use_case_examples/titanic && ./download_data.sh
           
-      - name: Refresh One Notebook
+      - name: Refresh ${{ github.event.inputs.notebook }}
         run: |
           make jupyter_execute_one NOTEBOOK="${{ env[env.NOTEBOOK_NAME] }}"
       
@@ -185,7 +191,7 @@ jobs:
       # review.
       - name: Open PR
         if: ${{ github.ref_name == 'main' || startsWith(github.ref_name , 'release/') }} 
-        uses: peter-evans/create-pull-request@284f54f989303d2699d373481a0cfa13ad5a6666
+        uses: peter-evans/create-pull-request@c5a7806660adbe173f04e3e038b0ccdcd758773c
         with:
           token: ${{ secrets.BOT_TOKEN }}
           commit-message: "chore: refresh ${{ github.event.inputs.notebook }} notebook"
@@ -201,7 +207,7 @@ jobs:
       # If the target branch is another branch, the current branch is automatically merged into it
       - name: Push changes into the current branch
         if: ${{ github.ref_name != 'main' && !(startsWith(github.ref_name , 'release/')) }}
-        uses: stefanzweifel/git-auto-commit-action@v4
+        uses: stefanzweifel/git-auto-commit-action@8621497c8c39c72f3e2a999a26b4ca1b5058a842 #v5.0.1
         with:
           commit_message: "chore: refresh ${{ github.event.inputs.notebook }} notebook"
           add_options: '-u'
@@ -214,14 +220,14 @@ jobs:
     if: ${{ always() && (needs.start-runner-linux.result != 'skipped') }}
     steps:
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@8c3f20df09ac63af7b3ae3d7c91f105f857d8497
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
       - name: Stop EC2 runner python 38
-        uses: machulav/ec2-github-runner@4e0303de215db88e1c489e07a15ca4d867f488ea
+        uses: machulav/ec2-github-runner@fcfb31a5760dad1314a64a0e172b78ec6fc8a17e
         if: ${{ always() && needs.start-runner-linux.outputs.ec2-instance-id-38 }}
         with:
           github-token: ${{ secrets.EC2_RUNNER_BOT_TOKEN }}
@@ -242,7 +248,7 @@ jobs:
     name: Send Slack notification
     runs-on: ubuntu-20.04
     steps:
-      - uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608
+      - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
 
       - name: Prepare whole job status
         if: ${{ always() }}
@@ -257,7 +263,7 @@ jobs:
 
       - name: Slack Notification
         continue-on-error: true
-        uses: rtCamp/action-slack-notify@b24d75fe0e728a4bf9fc42ee217caa686d141ee8
+        uses: rtCamp/action-slack-notify@4e5fb42d249be6a45a298f3c9543b111b02f7907
         env:
           SLACK_CHANNEL: ${{ secrets.SLACK_CHANNEL }}
           SLACK_ICON: https://pbs.twimg.com/profile_images/1274014582265298945/OjBKP9kn_400x400.png

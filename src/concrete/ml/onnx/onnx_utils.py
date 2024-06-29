@@ -1,4 +1,5 @@
 """Utils to interpret an ONNX model with numpy."""
+
 # Utils to interpret an ONNX model with numpy.
 
 
@@ -213,9 +214,7 @@
 
 # Original file:
 # https://github.com/google/jax/blob/f6d329b2d9b5f83c6a59e5739aa1ca8d4d1ffa1c/examples/onnx2xla.py
-
-
-from typing import Any, Callable, Dict, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import numpy
 import onnx
@@ -245,8 +244,10 @@ from .ops_impl import (
     numpy_div,
     numpy_elu,
     numpy_equal,
+    numpy_equal_float,
     numpy_erf,
     numpy_exp,
+    numpy_expand,
     numpy_flatten,
     numpy_floor,
     numpy_gather,
@@ -295,8 +296,12 @@ from .ops_impl import (
     numpy_tanh,
     numpy_thresholdedrelu,
     numpy_transpose,
+    numpy_unfold,
     numpy_unsqueeze,
     numpy_where,
+    rounded_numpy_equal_for_trees,
+    rounded_numpy_less_for_trees,
+    rounded_numpy_less_or_equal_for_trees,
 )
 
 ATTR_TYPES = dict(onnx.AttributeProto.AttributeType.items())
@@ -349,7 +354,6 @@ ONNX_OPS_TO_NUMPY_IMPL: Dict[str, Callable[..., Tuple[numpy.ndarray, ...]]] = {
     "Sub": numpy_sub,
     "Log": numpy_log,
     "Exp": numpy_exp,
-    "Equal": numpy_equal,
     "Identity": numpy_identity,
     "Reshape": numpy_reshape,
     "Transpose": numpy_transpose,
@@ -379,6 +383,8 @@ ONNX_OPS_TO_NUMPY_IMPL: Dict[str, Callable[..., Tuple[numpy.ndarray, ...]]] = {
     "Gather": numpy_gather,
     "Shape": numpy_shape,
     "ConstantOfShape": numpy_constant_of_shape,
+    "Expand": numpy_expand,
+    "Unfold": numpy_unfold,
 }
 
 
@@ -395,6 +401,7 @@ ONNX_COMPARISON_OPS_TO_NUMPY_IMPL_FLOAT: Dict[str, Callable[..., Tuple[numpy.nda
     "GreaterOrEqual": numpy_greater_or_equal_float,
     "Less": numpy_less_float,
     "LessOrEqual": numpy_less_or_equal_float,
+    "Equal": numpy_equal_float,
 }
 
 # Comparison operators used in tree-based models as they keep the outputs' boolean dtype.
@@ -405,14 +412,21 @@ ONNX_COMPARISON_OPS_TO_NUMPY_IMPL_BOOL: Dict[str, Callable[..., Tuple[numpy.ndar
     "GreaterOrEqual": numpy_greater_or_equal,
     "Less": numpy_less,
     "LessOrEqual": numpy_less_or_equal,
+    "Equal": numpy_equal,
 }
+# All numpy operators used for tree-based models that support auto rounding
+ONNX_COMPARISON_OPS_TO_ROUNDED_TREES_NUMPY_IMPL_BOOL = {
+    "Less": rounded_numpy_less_for_trees,
+    "Equal": rounded_numpy_equal_for_trees,
+    "LessOrEqual": rounded_numpy_less_or_equal_for_trees,
+}
+
 
 # All numpy operators used in QuantizedOps
 ONNX_OPS_TO_NUMPY_IMPL.update(ONNX_COMPARISON_OPS_TO_NUMPY_IMPL_FLOAT)
 
 # All numpy operators used for tree-based models
 ONNX_OPS_TO_NUMPY_IMPL_BOOL = {**ONNX_OPS_TO_NUMPY_IMPL, **ONNX_COMPARISON_OPS_TO_NUMPY_IMPL_BOOL}
-
 
 IMPLEMENTED_ONNX_OPS = set(ONNX_OPS_TO_NUMPY_IMPL.keys())
 
@@ -465,6 +479,63 @@ def execute_onnx_with_numpy(
         curr_inputs = (node_results[input_name] for input_name in node.input)
         attributes = {attribute.name: get_attribute(attribute) for attribute in node.attribute}
         outputs = ONNX_OPS_TO_NUMPY_IMPL_BOOL[node.op_type](*curr_inputs, **attributes)
+        node_results.update(zip(node.output, outputs))
+
+    return tuple(node_results[output.name] for output in graph.output)
+
+
+def execute_onnx_with_numpy_trees(
+    graph: onnx.GraphProto,
+    lsbs_to_remove_for_trees: Optional[Tuple[int, int]],
+    *inputs: numpy.ndarray,
+) -> Tuple[numpy.ndarray, ...]:
+    """Execute the provided ONNX graph on the given inputs for tree-based models only.
+
+    Args:
+        graph (onnx.GraphProto): The ONNX graph to execute.
+        lsbs_to_remove_for_trees (Optional[Tuple[int, int]]): This parameter is exclusively used for
+            optimizing tree-based models. It contains the values of the least significant bits to
+            remove during the tree traversal, where the first value refers to the first comparison
+            (either "less" or "less_or_equal"), while the second value refers to the "Equal"
+            comparison operation.
+            Default to None.
+        *inputs: The inputs of the graph.
+
+    Returns:
+        Tuple[numpy.ndarray]: The result of the graph's execution.
+    """
+
+    op_type: Callable[..., Tuple[numpy.ndarray[Any, Any], ...]]
+
+    # If no tree-based optimization is specified, return standard execution
+    if lsbs_to_remove_for_trees is None:
+        return execute_onnx_with_numpy(graph, *inputs)
+
+    node_results: Dict[str, numpy.ndarray] = dict(
+        {graph_input.name: input_value for graph_input, input_value in zip(graph.input, inputs)},
+        **{
+            initializer.name: numpy_helper.to_array(initializer)
+            for initializer in graph.initializer
+        },
+    )
+
+    for node in graph.node:
+        curr_inputs = (node_results[input_name] for input_name in node.input)
+        attributes = {attribute.name: get_attribute(attribute) for attribute in node.attribute}
+
+        if node.op_type in ONNX_COMPARISON_OPS_TO_ROUNDED_TREES_NUMPY_IMPL_BOOL:
+
+            # The first LSB refers to `Less` or `LessOrEqual` comparisons
+            # The second LSB refers to `Equal` comparison
+            stage = 0 if node.op_type != "Equal" else 1
+            attributes["lsbs_to_remove_for_trees"] = lsbs_to_remove_for_trees[stage]
+
+            # Use rounded numpy operation to relevant comparison nodes
+            op_type = ONNX_COMPARISON_OPS_TO_ROUNDED_TREES_NUMPY_IMPL_BOOL[node.op_type]
+        else:
+            op_type = ONNX_OPS_TO_NUMPY_IMPL_BOOL[node.op_type]
+
+        outputs = op_type(*curr_inputs, **attributes)
 
         node_results.update(zip(node.output, outputs))
     return tuple(node_results[output.name] for output in graph.output)

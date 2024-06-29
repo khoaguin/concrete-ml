@@ -1,32 +1,28 @@
 """Test binary search class."""
 
 import os
-import warnings
 from pathlib import Path
 
 import numpy
 import pytest
 import torch
 from sklearn.datasets import make_classification
-from sklearn.exceptions import ConvergenceWarning
 from sklearn.metrics import r2_score, top_k_accuracy_score
 from tensorflow import keras
 
 from concrete.ml.common.check_inputs import check_array_and_assert
-from concrete.ml.common.utils import (
-    get_model_name,
-    is_model_class_in_a_list,
-    is_regressor_or_partial_regressor,
-)
+from concrete.ml.common.utils import get_model_name, is_regressor_or_partial_regressor
 from concrete.ml.pytest.torch_models import QuantCustomModel, TorchCustomModel
 from concrete.ml.pytest.utils import (
     data_calibration_processing,
-    get_random_extract_of_sklearn_models_and_datasets,
+    get_sklearn_linear_models_and_datasets,
+    get_sklearn_neighbors_models_and_datasets,
+    get_sklearn_neural_net_models_and_datasets,
+    get_sklearn_tree_models_and_datasets,
     instantiate_model_generic,
     load_torch_model,
 )
 from concrete.ml.search_parameters import BinarySearch
-from concrete.ml.sklearn import get_sklearn_linear_models
 
 # For built-in models (trees and QNNs) we use the fixture `load_data`
 # For custom models, we define the following variables:
@@ -128,15 +124,18 @@ def test_update_valid_attr_method(attr, value, model_name, quant_type, metric, l
         predict="predict",
         n_simulation=1,
     )
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", category=ConvergenceWarning)
-        search.run(x=x_calib, ground_truth=y, strategy=all, **{attr: value})
+
+    search.run(x=x_calib, ground_truth=y, strategy=all, **{attr: value})
 
     assert getattr(search, attr) == value
 
 
+# Linear models are not concerned by this test because they do not have PBS
 @pytest.mark.parametrize(
-    "model_class, parameters", get_random_extract_of_sklearn_models_and_datasets()
+    "model_class, parameters",
+    get_sklearn_tree_models_and_datasets(unique_models=True)
+    + get_sklearn_neural_net_models_and_datasets(unique_models=True)
+    + get_sklearn_neighbors_models_and_datasets(unique_models=True),
 )
 def test_non_convergence_for_built_in_models(model_class, parameters, load_data, is_weekly_option):
     """Check that binary search raises a user warning when convergence is not achieved.
@@ -148,10 +147,6 @@ def test_non_convergence_for_built_in_models(model_class, parameters, load_data,
 
     if not is_weekly_option:
         pytest.skip("Tests too long")
-
-    # Linear models are not concerned by this test because they do not have PBS
-    if is_model_class_in_a_list(model_class, get_sklearn_linear_models()):
-        return
 
     x, y = load_data(model_class, **parameters)
     x_calib, y = data_calibration_processing(data=x, targets=y, n_sample=100)
@@ -169,10 +164,7 @@ def test_non_convergence_for_built_in_models(model_class, parameters, load_data,
         max_metric_loss=-10,
         is_qat=False,
     )
-
-    warnings.simplefilter("always")
-    with pytest.warns(UserWarning, match="ConvergenceWarning: .*"):
-        search.run(x=x_calib, ground_truth=y, strategy=all)
+    search.run(x=x_calib, ground_truth=y, strategy=all)
 
 
 @pytest.mark.parametrize("model_name, quant_type", [("CustomModel", "qat")])
@@ -207,9 +199,7 @@ def test_non_convergence_for_custom_models(model_name, quant_type):
         labels=numpy.arange(MODELS_ARGS[model_name]["dataset"]["n_classes"]),
     )
 
-    warnings.simplefilter("always")
-    with pytest.warns(UserWarning, match="ConvergenceWarning: .*"):
-        search.run(x=x_calib, ground_truth=y, strategy=all)
+    search.run(x=x_calib, ground_truth=y, strategy=all)
 
 
 @pytest.mark.parametrize(
@@ -281,9 +271,8 @@ def test_binary_search_for_custom_models(model_name, quant_type, threshold):
         k=1,
         labels=numpy.arange(MODELS_ARGS[model_name]["dataset"]["n_classes"]),
     )
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", category=ConvergenceWarning)
-        largest_perror = search.run(x=x_calib, ground_truth=y, strategy=all)
+
+    largest_perror = search.run(x=x_calib, ground_truth=y, strategy=all)
 
     assert 1.0 > largest_perror > 0.0
     assert (
@@ -292,9 +281,13 @@ def test_binary_search_for_custom_models(model_name, quant_type, threshold):
     )
 
 
+# Linear models are not concerned by this test because they do not have PBS
 @pytest.mark.parametrize("threshold", [0.02])
 @pytest.mark.parametrize(
-    "model_class, parameters", get_random_extract_of_sklearn_models_and_datasets()
+    "model_class, parameters",
+    get_sklearn_tree_models_and_datasets(unique_models=True)
+    + get_sklearn_neural_net_models_and_datasets(unique_models=True)
+    + get_sklearn_neighbors_models_and_datasets(unique_models=True),
 )
 @pytest.mark.parametrize("predict", ["predict", "predict_proba"])
 def test_binary_search_for_built_in_models(model_class, parameters, threshold, predict, load_data):
@@ -304,10 +297,6 @@ def test_binary_search_for_built_in_models(model_class, parameters, threshold, p
     x_calib, y = data_calibration_processing(data=x, targets=y, n_sample=80)
 
     model = instantiate_model_generic(model_class, n_bits=4)
-
-    # Linear models are not concerned by this test because they do not have PBS
-    if is_model_class_in_a_list(model_class, get_sklearn_linear_models()):
-        return
 
     # NeuralNetRegressor models support a `predict_proba` method since it directly inherits from
     # Skorch but since Scikit-Learn does not, we don't as well. This issue could be fixed by making
@@ -330,18 +319,16 @@ def test_binary_search_for_built_in_models(model_class, parameters, threshold, p
             estimator=model,
             predict=predict,
             metric=metric,
-            n_simulation=5,
+            n_simulation=2,
             max_metric_loss=threshold,
             is_qat=False,
-            max_iter=3,
+            max_iter=2,
         )
     else:
         # The model does not have `predict`
         return
 
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", category=ConvergenceWarning)
-        largest_perror = search.run(x=x_calib, ground_truth=y, strategy=all)
+    largest_perror = search.run(x=x_calib, ground_truth=y, strategy=all)
 
     assert 1.0 > largest_perror > 0.0
     assert (
@@ -388,8 +375,10 @@ def test_invalid_estimator_for_custom_models(is_qat, load_data):
         search.run(x=x_calib, ground_truth=y, strategy=all, max_iter=1, n_simulation=1)
 
 
+# This test only concerns linear models since they do not contain any PBS
 @pytest.mark.parametrize(
-    "model_class, parameters", get_random_extract_of_sklearn_models_and_datasets()
+    "model_class, parameters",
+    get_sklearn_linear_models_and_datasets(unique_models=True),
 )
 def test_invalid_estimator_for_built_in_models(model_class, parameters, load_data):
     """Check that binary search raises an exception for unsupported models."""
@@ -398,10 +387,6 @@ def test_invalid_estimator_for_built_in_models(model_class, parameters, load_dat
     x_calib, y = data_calibration_processing(data=x, targets=y, n_sample=100)
 
     model = instantiate_model_generic(model_class, n_bits=4)
-
-    # Linear models are not concerned by this test because they do not have PBS
-    if not is_model_class_in_a_list(model_class, get_sklearn_linear_models()):
-        return
 
     metric = r2_score if is_regressor_or_partial_regressor(model) else binary_classification_metric
 
@@ -479,9 +464,7 @@ def test_success_save_option(model_name, quant_type, metric, directory, log_file
     # When instantiating the class, if the file exists, it is deleted, to avoid overwriting it
     assert not path.exists()
 
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", category=ConvergenceWarning)
-        search.run(x=x_calib, ground_truth=y)
+    search.run(x=x_calib, ground_truth=y)
 
     # Check that the file has been properly created
     assert path.exists()

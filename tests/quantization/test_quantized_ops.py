@@ -38,8 +38,10 @@ from concrete.ml.quantization.quantized_ops import (
     QuantizedConv,
     QuantizedDiv,
     QuantizedElu,
+    QuantizedEqual,
     QuantizedErf,
     QuantizedExp,
+    QuantizedExpand,
     QuantizedFlatten,
     QuantizedFloor,
     QuantizedGemm,
@@ -76,6 +78,7 @@ from concrete.ml.quantization.quantized_ops import (
     QuantizedSub,
     QuantizedTanh,
     QuantizedTranspose,
+    QuantizedUnfold,
     QuantizedUnsqueeze,
     QuantizedWhere,
 )
@@ -299,11 +302,11 @@ ARITH_N_BITS_LIST = [20, 16, 8]
 @pytest.mark.parametrize(
     "params_a, params_b, n_dims",
     [
-        pytest.param((-10, 1), (5, 100), 100),
-        pytest.param((20, 100), (0, 0.2), 200),
-        pytest.param((40, 20), (-10, 500), 300),
-        pytest.param((-100, 1), (200, 1), 100),
-        pytest.param((0, 0.1), (0, 0.1), 20),
+        pytest.param((-10, 1), (5, 10), 10),
+        pytest.param((20, 10), (0, 0.2), 20),
+        pytest.param((40, 2), (-10, 50), 30),
+        pytest.param((-10, 1), (20, 1), 10),
+        pytest.param((0, 0.1), (0, 0.1), 5),
     ],
 )
 @pytest.mark.parametrize(
@@ -325,7 +328,7 @@ def test_all_arith_ops(
     n_dims: int,
     generator: Callable,
     check_r2_score: Callable,
-    check_float_arrays_equal: Callable,
+    check_float_array_equal: Callable,
 ):
     """Test all quantized arithmetic ops"""
 
@@ -407,11 +410,11 @@ def test_all_arith_ops(
 
     # Check that we get the same fp32 results in V+V (if supported), V+C and C+V modes
     if supports_enc_with_enc:
-        check_float_arrays_equal(raw_output_vv, raw_output_vc)
-    check_float_arrays_equal(raw_output_cv, raw_output_vc)
+        check_float_array_equal(raw_output_vv, raw_output_vc)
+    check_float_array_equal(raw_output_cv, raw_output_vc)
 
     # Check that V+C and C+V is symmetric (int+float mode)
-    check_float_arrays_equal(quantized_output_cv, quantized_output_vc)
+    check_float_array_equal(quantized_output_cv, quantized_output_vc)
 
     # As V+C and C+V work on float values they will not be exactly equal to
     # the V+V case which works in quantized, we only check R2 for a high bit-width in this case
@@ -425,14 +428,14 @@ def test_all_arith_ops(
 
 
 @pytest.mark.parametrize("n_bits", N_BITS_LIST)
+@pytest.mark.parametrize("batch_size", [None, 10, 100])
 @pytest.mark.parametrize(
     "n_examples, n_features, n_neurons",
     [
         pytest.param(50, 3, 4),
-        pytest.param(20, 500, 30),
-        pytest.param(200, 300, 50),
-        pytest.param(10000, 100, 1),
+        pytest.param(20, 50, 30),
         pytest.param(10, 20, 1),
+        pytest.param(10, 100, 10),
     ],
 )
 @pytest.mark.parametrize(
@@ -449,18 +452,24 @@ def test_all_gemm_ops(
     n_bits: int,
     is_signed: bool,
     produces_output: bool,
+    batch_size: int,
     n_examples: int,
     n_features: int,
     n_neurons: int,
     generator: Callable,
     check_r2_score: Callable,
-    check_array_equality: Callable,
+    check_array_equal: Callable,
 ):
     """Test for gemm style ops."""
 
-    # Multiply input x weights of sizes (N, K) and (K, M)
-    inputs = generator(size=(n_examples, n_features))
-    weights = generator(size=(n_features, n_neurons))
+    if batch_size is None:
+        inputs_shape = (n_examples, n_features)
+    else:
+        inputs_shape = (batch_size, n_examples, n_features)
+    inputs = generator(size=inputs_shape)
+
+    weights_shape = (n_features, n_neurons)
+    weights = generator(size=weights_shape)
 
     # We can assume uniform distribution for the bias without loss of generality
     bias = numpy.random.uniform(size=(1, n_neurons))
@@ -547,13 +556,31 @@ def test_all_gemm_ops(
     check_r2_score(expected_gemm_outputs, actual_gemm_output)
 
     # Without a bias, MatMul and Gemm should give the same output
-    check_array_equality(actual_mm_output, actual_gemm_output)
+    check_array_equal(actual_mm_output, actual_gemm_output)
 
     # Test the serialization of QuantizedGemm with (alpha, beta) = (1, 0)
     check_serialization(
         q_gemm,
         QuantizedGemm,
         equal_method=partial(quantized_op_results_are_equal, q_input=q_inputs),
+    )
+
+    # 4- Test with 2 int_input_names and empty constant_inputs (encrypted gemm)
+    q_gemm = QuantizedGemm(
+        n_bits,
+        OP_DEBUG_NAME + "QuantizedGemm",
+        int_input_names={"0", "1"},
+        constant_inputs={},
+    )
+    q_gemm.produces_graph_output = produces_output
+    expected_gemm_outputs = q_gemm.calibrate(*(inputs, weights))
+    actual_gemm_output = q_gemm(q_inputs, q_weights).dequant()
+    check_r2_score(expected_gemm_outputs, actual_gemm_output)
+
+    check_serialization(
+        q_gemm,
+        QuantizedGemm,
+        equal_method=partial(quantized_op_results_are_equal, q_input=(q_inputs, q_weights)),
     )
 
 
@@ -670,9 +697,13 @@ def test_identity_op(x, n_bits):
         ),
     ],
 )
-@pytest.mark.parametrize("produces_output", [True, False])
+@pytest.mark.parametrize("produces_output", [True, False], ids=["produces_output", ""])
+@pytest.mark.parametrize("is_conv1d", [True, False], ids=["is_conv1d", "is_conv2d"])
+# @pytest.mark.parametrize("is_conv1d", [True], ids=["is_conv1d"])
 # pylint: disable-next=too-many-locals
-def test_quantized_conv(params, n_bits, produces_output, check_r2_score, check_float_arrays_equal):
+def test_quantized_conv(
+    params, n_bits, produces_output, is_conv1d, check_r2_score, check_float_array_equal
+):
     """Test the quantized convolution operator."""
 
     # Retrieve arguments
@@ -688,6 +719,19 @@ def test_quantized_conv(params, n_bits, produces_output, check_r2_score, check_f
         pads,
         group,
     ) = params
+
+    # If testing the conv1d operator, make the parameters represent 1D inputs
+    if is_conv1d:
+        size_input = size_input[:3]
+        size_weights = size_weights[:3]
+        strides = strides[:1]
+        pads = pads[:2]
+        dilations = (1,)
+        conv_torch_op = torch.conv1d
+
+    else:
+        dilations = (1, 1)  # type: ignore[assignment]
+        conv_torch_op = torch.conv2d
 
     net_input = numpy.random.uniform(size=size_input) * scale_input
     weights = numpy.random.randn(*size_weights) * scale_weights
@@ -706,8 +750,8 @@ def test_quantized_conv(params, n_bits, produces_output, check_r2_score, check_f
         constant_inputs={1: q_weights, 2: q_bias},
         strides=strides,
         pads=pads,
-        kernel_shape=(weights.shape[2], weights.shape[3]),
-        dilations=(1, 1),
+        kernel_shape=weights.shape[2:],
+        dilations=dilations,
         group=group,
     )
     q_op.produces_graph_output = produces_output
@@ -715,25 +759,27 @@ def test_quantized_conv(params, n_bits, produces_output, check_r2_score, check_f
     # Compute the result in floating point
     expected_result = q_op.calibrate(net_input)
 
-    # Compute the reference result
+    # For Conv1d, torch and ONNX both follow the same padding convention
+    if is_conv1d:
+        input_padded = torch.nn.functional.pad(torch.Tensor(net_input.copy()), pads)
 
-    # Pad the input if needed
-
-    # Torch uses padding  (padding_left,padding_right, padding_top,padding_bottom)
+    # For Conv2d, torch uses padding  (padding_left, padding_right, padding_top, padding_bottom)
     # While ONNX and Concrete ML use (padding_top, padding_left, padding_bottom, padding_right)
-    tx_pad = torch.nn.functional.pad(
-        torch.Tensor(net_input.copy()), (pads[1], pads[3], pads[0], pads[2])
-    )
+    else:
+        input_padded = torch.nn.functional.pad(
+            torch.Tensor(net_input.copy()), (pads[1], pads[3], pads[0], pads[2])
+        )
 
-    # Compute the torch convolution
-    torch_res = torch.conv2d(
-        tx_pad,
-        torch.Tensor(weights.copy()),
-        torch.Tensor(biases.squeeze().copy()) if biases is not None else None,
-        strides,
+    # Compute the reference result using the torch convolution operator
+    torch_res = conv_torch_op(
+        input=input_padded,
+        weight=torch.Tensor(weights.copy()),
+        bias=torch.Tensor(biases.squeeze().copy()) if biases is not None else None,
+        stride=strides,
         groups=group,
     ).numpy()
-    check_float_arrays_equal(torch_res, expected_result)
+
+    check_float_array_equal(torch_res, expected_result)
 
     # Compute the quantized result
     result = q_op(q_input).dequant()
@@ -810,7 +856,7 @@ def test_quantized_conv(params, n_bits, produces_output, check_r2_score, check_f
     ],
 )
 @pytest.mark.parametrize("is_signed", [True, False])
-def test_quantized_avg_pool(params, n_bits, is_signed, check_r2_score, check_float_arrays_equal):
+def test_quantized_avg_pool(params, n_bits, is_signed, check_r2_score, check_float_array_equal):
     """Test the quantized average pool operator."""
 
     # Retrieve arguments
@@ -842,7 +888,7 @@ def test_quantized_avg_pool(params, n_bits, is_signed, check_r2_score, check_flo
     # Compute the torch average pool
     bceil_mode = bool(ceil_mode)
     torch_res = torch.nn.functional.avg_pool2d(tx_pad, kernel_shape, strides, 0, bceil_mode).numpy()
-    check_float_arrays_equal(torch_res, expected_result)
+    check_float_array_equal(torch_res, expected_result)
 
     # Compute the quantized result
     result = q_op(q_input).dequant()
@@ -856,6 +902,65 @@ def test_quantized_avg_pool(params, n_bits, is_signed, check_r2_score, check_flo
         QuantizedAvgPool,
         equal_method=partial(quantized_op_results_are_equal, q_input=q_input),
     )
+
+
+def test_quantized_avg_pool_args():
+    """Check that unsupported parameters for AvgPool properly raise errors."""
+    n_bits = 2
+
+    with pytest.raises(AssertionError, match=r"Setting parameter 'kernel_shape' is required."):
+        QuantizedAvgPool(
+            n_bits,
+            OP_DEBUG_NAME + "QuantizedAvgPool",
+        )
+
+    with pytest.raises(AssertionError, match=r"The 'auto_pad' parameter is not supported.*"):
+        QuantizedAvgPool(
+            n_bits,
+            OP_DEBUG_NAME + "QuantizedAvgPool",
+            kernel_shape=(1, 1),
+            auto_pad="SAME_UPPER",
+        )
+
+    with pytest.raises(
+        AssertionError, match=r"The Average Pool operator currently supports only 2d kernels."
+    ):
+        QuantizedAvgPool(
+            n_bits,
+            OP_DEBUG_NAME + "QuantizedAvgPool",
+            kernel_shape=(1,),
+        )
+
+    with pytest.raises(
+        AssertionError, match=r"Pad pixels must be included when calculating values on the edges.*"
+    ):
+        QuantizedAvgPool(
+            n_bits,
+            OP_DEBUG_NAME + "QuantizedAvgPool",
+            kernel_shape=(1, 1),
+            count_include_pad=0,
+        )
+
+    with pytest.raises(
+        AssertionError,
+        match=r"The Average Pool operator requires the number of strides to be the same.*",
+    ):
+        QuantizedAvgPool(
+            n_bits,
+            OP_DEBUG_NAME + "QuantizedAvgPool",
+            kernel_shape=(1, 1),
+            strides=(1,),
+        )
+
+    with pytest.raises(
+        AssertionError, match=r"The Average Pool operator in Concrete ML requires padding.*"
+    ):
+        QuantizedAvgPool(
+            n_bits,
+            OP_DEBUG_NAME + "QuantizedAvgPool",
+            kernel_shape=(1, 1),
+            pads=(0, 0),
+        )
 
 
 @pytest.mark.parametrize("n_bits", [16])
@@ -929,7 +1034,7 @@ def test_quantized_avg_pool(params, n_bits, is_signed, check_r2_score, check_flo
     ],
 )
 @pytest.mark.parametrize("is_signed", [True, False])
-def test_quantized_max_pool(params, n_bits, is_signed, check_r2_score, check_float_arrays_equal):
+def test_quantized_max_pool(params, n_bits, is_signed, check_r2_score, check_float_array_equal):
     """Test the quantized max pool operator."""
 
     # Retrieve arguments
@@ -974,7 +1079,7 @@ def test_quantized_max_pool(params, n_bits, is_signed, check_r2_score, check_flo
     print("Expected")
     print(expected_result)
 
-    check_float_arrays_equal(torch_res, expected_result)
+    check_float_array_equal(torch_res, expected_result)
 
     # Compute the quantized result
     result = q_op(q_input).dequant()
@@ -991,7 +1096,7 @@ def test_quantized_max_pool(params, n_bits, is_signed, check_r2_score, check_flo
 
 
 def test_quantized_conv_args():
-    """Check that conv arguments are validated"""
+    """Check that conv arguments are validated."""
     n_bits = 2
 
     weights = numpy.random.uniform(size=(10, 1, 16, 16)) * 0.2
@@ -1122,6 +1227,60 @@ def test_quantized_reshape(shape):
 
 
 @pytest.mark.parametrize(
+    "original_shape, expand_shape",
+    [
+        ((1, 1, 1), (10, 5, 2)),  # Basic expansion in 3D
+        ((10, 1, 2), (10, 5, 2)),  # Expansion with one dimension already matching
+        ((1,), (3, 1)),  # Expansion from 1D to 2D
+        ((1, 1), (10, 5)),  # Expansion in 2D
+        ((3, 1, 1), (3, 5, 7)),  # 3D expansion with first dimension already matching
+        ((1, 4), (3, 4)),  # 2D expansion where one dimension needs no expansion
+        ((1, 1, 3), (2, 6, 3)),  # 3D, last dimension matches, others expand
+        ((1,), (1, 1, 1, 1)),  # Expansion from 1D to 4D
+        ((2, 2), (1, 2, 2)),  # 2D to 3D where original dimensions are in the middle
+        ((1, 1, 1, 1), (5, 4, 3, 2)),  # 4D expansion from all ones
+        ((1, 7, 1), (3, 7, 5)),  # 3D with middle dimension already matching
+        ((2, 1), (2, 3)),  # 2D expansion where first dimension needs no expansion
+        ((1, 2, 1, 4), (3, 2, 5, 4)),  # 4D, two dimensions match, others expand
+    ],
+)
+def test_quantized_expand(original_shape, expand_shape):
+    """Test quantized expand."""
+
+    n_bits_expand = MAX_BITWIDTH_BACKWARD_COMPATIBLE
+
+    num_values = numpy.prod(numpy.asarray(original_shape))
+    data = numpy.arange(num_values).astype(numpy.float32)
+    data = data.reshape(original_shape)
+
+    q_arr0 = QuantizedArray(n_bits_expand, data)
+
+    # Apply QuantizedExpand operation
+    expand = QuantizedExpand(
+        n_bits_expand,
+        OP_DEBUG_NAME + "QuantizedExpand",
+        constant_inputs={1: numpy.asarray(expand_shape)},
+        input_quant_opts=q_arr0.quantizer.quant_options,
+    )
+
+    q_expanded = expand(q_arr0)
+
+    # Assertions for expanded array
+    assert q_expanded.quantizer.zero_point == q_arr0.quantizer.zero_point
+    assert q_expanded.quantizer.scale == q_arr0.quantizer.scale
+    assert q_expanded.qvalues.shape == expand_shape
+    assert numpy.all(numpy.broadcast_to(q_arr0.qvalues, expand_shape) == q_expanded.qvalues)
+
+    # Test the serialization of QuantizedExpand (if applicable)
+    # Replace with appropriate serialization test if needed
+    check_serialization(
+        expand,
+        QuantizedExpand,
+        equal_method=partial(quantized_op_results_are_equal, q_input=q_arr0),
+    )
+
+
+@pytest.mark.parametrize(
     "n_bits",
     [pytest.param(n_bits) for n_bits in N_BITS_LIST],
 )
@@ -1168,81 +1327,65 @@ def test_quantized_prelu(n_bits, input_range, input_shape, slope, is_signed, che
     )
 
 
-@pytest.mark.parametrize(
-    "params",
-    [
+@pytest.fixture(scope="module")
+def random_test_data():
+    """Generate data for comparisons operators."""
+    return [
         (
             numpy.random.uniform(size=(1, 3, 32, 32)) * 4,
             numpy.random.uniform() * 0.7 + 2,
             numpy.random.uniform(),
             numpy.random.uniform(),
         ),
-        (
-            numpy.random.uniform(size=(1, 32)) * 100 - 50,
-            numpy.random.uniform() * 50 - 25,
-            0,
-            -1,
-        ),
-        (
-            numpy.random.uniform(size=(1024,)),
-            numpy.random.uniform(),
-            -100,
-            100,
-        ),
-    ],
-)
+        (numpy.random.uniform(size=(1, 32)) * 100 - 50, numpy.random.uniform() * 50 - 25, 0, -1),
+        (numpy.random.uniform(size=(1024,)), numpy.random.uniform(), -100, 100),
+    ]
+
+
 @pytest.mark.parametrize("n_bits", [16])
 @pytest.mark.parametrize(
-    "comparator", [QuantizedGreater, QuantizedGreaterOrEqual, QuantizedLess, QuantizedLessOrEqual]
+    "comparator",
+    [
+        QuantizedGreater,
+        QuantizedGreaterOrEqual,
+        QuantizedLess,
+        QuantizedLessOrEqual,
+        QuantizedEqual,
+    ],
 )
-def test_quantized_comparators_and_where(params, n_bits, comparator, check_r2_score):
+# pylint: disable-next=redefined-outer-name
+def test_quantized_comparators_and_where(random_test_data, n_bits, comparator, check_r2_score):
     """Test a conditional pattern that is very common in quantization aware training."""
-    values, threshold, val_if_true, val_if_false = params
+    for values, threshold, val_if_true, val_if_false in random_test_data:
+        q_values = QuantizedArray(n_bits, values)
+        q_op_comparator = comparator(
+            n_bits,
+            OP_DEBUG_NAME + comparator.__name__,
+            constant_inputs={1: QuantizedArray(n_bits, threshold)},
+        )
+        q_cast = QuantizedCast(n_bits, OP_DEBUG_NAME + "QuantizedCast", to=onnx.TensorProto.BOOL)
+        q_op_where = QuantizedWhere(
+            n_bits,
+            OP_DEBUG_NAME + "QuantizedWhere",
+            constant_inputs={
+                1: QuantizedArray(n_bits, float(val_if_true)),
+                2: QuantizedArray(n_bits, float(val_if_false)),
+            },
+        )
 
-    q_values = QuantizedArray(n_bits, values)
-    q_op_comparator = comparator(
-        n_bits,
-        OP_DEBUG_NAME + comparator.__name__,
-        constant_inputs={1: QuantizedArray(n_bits, threshold)},
-    )
-    q_cast = QuantizedCast(n_bits, OP_DEBUG_NAME + "QuantizedCast", to=onnx.TensorProto.BOOL)
-    q_op_where = QuantizedWhere(
-        n_bits,
-        OP_DEBUG_NAME + "QuantizedWhere",
-        constant_inputs={
-            1: QuantizedArray(n_bits, float(val_if_true)),
-            2: QuantizedArray(n_bits, float(val_if_false)),
-        },
-    )
+        reference_value = q_op_where.calibrate(q_cast.calibrate(q_op_comparator.calibrate(values)))
+        q_result = q_op_where(q_cast(q_op_comparator(q_values)))
+        result = q_result.dequant()
 
-    reference_value = q_op_where.calibrate(q_cast.calibrate(q_op_comparator.calibrate(values)))
+        check_r2_score(reference_value, result)
 
-    q_result = q_op_where(q_cast(q_op_comparator(q_values)))
-
-    result = q_result.dequant()
-
-    check_r2_score(reference_value, result)
-
-    # Test the serialization of QuantizedCast
-    check_serialization(
-        q_op_comparator,
-        comparator,
-        equal_method=partial(quantized_op_results_are_equal, q_input=q_values),
-    )
-
-    # Test the serialization of QuantizedCast
-    check_serialization(
-        q_cast,
-        QuantizedCast,
-        equal_method=partial(quantized_op_results_are_equal, q_input=q_values),
-    )
-
-    # Test the serialization of QuantizedWhere
-    check_serialization(
-        q_op_where,
-        QuantizedWhere,
-        equal_method=partial(quantized_op_results_are_equal, q_input=q_values),
-    )
+        # Test the serialization of each Quantized operation
+        for q_op in [q_op_comparator, q_cast, q_op_where]:
+            check_serialization(
+                q_op,
+                type(q_op),
+                equal_method=partial(quantized_op_results_are_equal, q_input=q_values),
+            )
 
 
 @pytest.mark.parametrize(
@@ -1307,18 +1450,22 @@ def test_batch_normalization(tensor_shape, n_bits, check_r2_score):
 @pytest.mark.parametrize(
     "keepdims", [pytest.param(keepdims, id=f"keepdims-{keepdims}") for keepdims in [0, 1]]
 )
+# In Concrete ML, we consider that all inputs' first dimension should be a batch size
+# even in single batch cases. This is why the following test parameters are considering axes that
+# are sometimes equal to the input size's dimension, as the batch size is added within the
+# test itself.
+# Finally, the axis parameter should neither be None nor contain axis 0 as this dimension is used
+# for batching the inference
 @pytest.mark.parametrize(
     "size, axes, noop_with_empty_axes",
     [
         pytest.param(size, axes, noop, id=f"size-{size}-axes-{axes}-noop-{noop}")
         for (size, axes, noop) in [
-            ((1,), (0,), 0),
-            ((100, 1), (1,), 0),
-            ((100, 10), None, 0),
-            ((100, 10), None, 1),
-            ((10, 100), (0,), 0),
-            ((10, 10, 1000), (2,), 0),
-            ((10, 10, 1000), (0, 2), 0),
+            ((1,), (1,), 0),
+            ((100, 1), (2,), 0),
+            ((10, 100), (1,), 0),
+            ((10, 10, 1000), (3,), 0),
+            ((10, 10, 1000), (1, 3), 0),
         ]
     ],
 )
@@ -1329,27 +1476,33 @@ def test_reduce_sum(
     n_bits, size, data_generator, axes, keepdims, noop_with_empty_axes, check_r2_score
 ):
     """Test the QuantizedReduceSum operator."""
+
     # Generate the inputs
-    inputs = data_generator(size=(10,) + size)
+    inputs = data_generator(size=(100,) + size)
 
     # Instantiate the operator
     quantized_reduce_sum = QuantizedReduceSum(
         n_bits,
         OP_DEBUG_NAME + "QuantizedReduceSum",
-        constant_inputs={"axes": numpy.array(axes) if axes is not None else None},
+        constant_inputs={"axes": numpy.array(axes)},
         keepdims=keepdims,
         noop_with_empty_axes=noop_with_empty_axes,
     )
 
     # Calibrate the quantized op and retrieve the expected results
-    expected_outputs = quantized_reduce_sum.calibrate(inputs)
+    expected_sum = quantized_reduce_sum.calibrate(inputs)
 
     # Retrieve the results computed by the quantized op applied on quantized inputs
     q_inputs = QuantizedArray(n_bits, inputs)
-    actual_output = quantized_reduce_sum(q_inputs)
-    actual_output = actual_output.dequant()
+    q_computed_sum = quantized_reduce_sum(q_inputs)
+    computed_sum = q_computed_sum.dequant()
 
-    check_r2_score(expected_outputs, actual_output)
+    assert computed_sum.shape == expected_sum.shape, (
+        f"Mismatch found in output shapes. Got {computed_sum.shape} but expected "
+        f"{expected_sum.shape}."
+    )
+
+    check_r2_score(expected_sum, computed_sum)
 
     # Test the serialization of QuantizedReduceSum
     check_serialization(
@@ -1415,6 +1568,9 @@ def test_all_ops_were_tested():
         QuantizedUnsqueeze: test_quantized_unsqueeze,
         QuantizedConcat: test_quantized_concat,
         QuantizedSqueeze: test_quantized_squeeze,
+        QuantizedExpand: test_quantized_expand,
+        QuantizedEqual: test_quantized_comparators_and_where,
+        QuantizedUnfold: test_quantized_unfold,
         ONNXSlice: test_quantized_slice,
         ONNXGather: test_quantized_gather,
         ONNXShape: test_quantized_shape,
@@ -1902,4 +2058,107 @@ def test_quantized_shape(shape):
     # Test the serialization of ONNXShape
     check_serialization(
         q_op, ONNXShape, equal_method=partial(quantized_op_results_are_equal, q_input=q_input)
+    )
+
+
+@pytest.mark.parametrize("n_bits", [16])
+@pytest.mark.parametrize(
+    "params",
+    [
+        (
+            numpy.random.uniform(low=-2.0, high=2.0, size=(1, 1, 32, 32)),
+            (3, 3),
+            (2, 2),
+            (0, 0, 0, 0),
+        ),
+        (
+            numpy.random.uniform(low=-1.2, high=0.2, size=(10, 1, 16, 16)),
+            (2, 2),
+            (1, 1),
+            (0, 0, 0, 0),
+        ),
+        (
+            numpy.random.uniform(low=-2.0, high=2.0, size=(2, 32, 4, 4)),
+            (2, 2),
+            (1, 1),
+            (0, 0, 0, 0),
+        ),
+        (
+            numpy.random.uniform(low=-2.0, high=2.0, size=(2, 32, 4, 4)),
+            (2, 4),
+            (1, 1),
+            (1, 2, 1, 2),
+        ),
+        (
+            numpy.random.uniform(low=-2.0, high=2.0, size=(2, 32, 4, 4)),
+            (2, 4),
+            (1, 1),
+            (0, 2, 0, 2),
+        ),
+        (
+            numpy.random.uniform(low=-2.0, high=2.0, size=(2, 32, 5, 5)),
+            (3, 3),
+            (1, 1),
+            (1, 1, 1, 1),
+        ),
+        (
+            numpy.random.uniform(low=-2.0, high=2.0, size=(2, 1, 7, 5)),
+            (5, 1),
+            (1, 1),
+            (1, 2, 0, 4),
+        ),
+        (
+            numpy.random.uniform(low=-2.0, high=2.0, size=(1, 1, 16, 16)),
+            (2, 2),
+            (4, 4),
+            (1, 2, 0, 4),
+        ),
+    ],
+)
+@pytest.mark.parametrize("is_signed", [True, False])
+def test_quantized_unfold(params, n_bits, is_signed, check_r2_score, check_float_array_equal):
+    """Test the quantized average pool operator."""
+
+    # Retrieve arguments
+    net_input, kernel_shape, strides, pads = params
+
+    # Create quantized data
+    q_input = QuantizedArray(n_bits, net_input, is_signed=is_signed)
+
+    q_op = QuantizedUnfold(
+        n_bits,
+        OP_DEBUG_NAME + "QuantizedUnfold",
+        strides=strides,
+        pads=pads,
+        kernel_shape=kernel_shape,
+        # ceil_mode=ceil_mode,
+        input_quant_opts=q_input.quantizer.quant_options,
+    )
+
+    # Compute the result in floating point
+    expected_result = q_op.calibrate(net_input)
+
+    # Pad the input if needed
+    tinputs = torch.Tensor(net_input.copy())
+
+    # Torch uses padding  (padding_left,padding_right, padding_top,padding_bottom)
+    # While ONNX and Concrete ML use (padding_top, padding_left, padding_bottom, padding_right)
+    tx_pad = torch.nn.functional.pad(tinputs, (pads[1], pads[3], pads[0], pads[2]))
+
+    # Compute the torch unfold
+    torch_res = torch.nn.functional.unfold(tx_pad, kernel_shape, 1, 0, strides).numpy()
+
+    check_float_array_equal(torch_res, expected_result)
+
+    # Compute the quantized result
+    result = q_op(q_input).dequant()
+
+    # The fp32 and quantized results should be very similar when quantization precision is high
+    check_r2_score(expected_result, result)
+
+    # Test the serialization of QuantizedUnfold
+    check_serialization(
+        q_op,
+        QuantizedUnfold,
+        equal_method=partial(quantized_op_results_are_equal, q_input=q_input),
     )

@@ -84,8 +84,9 @@ linux_install_github_cli () {
     # Installs github cli
     # https://github.com/cli/cli/blob/trunk/docs/install_linux.md#debian-ubuntu-linux-raspberry-pi-os-apt
     echo "Installing github-CLI"
-    wget https://github.com/cli/cli/releases/download/v2.14.7/gh_2.14.7_linux_amd64.deb
-    dpkg -i gh_2.14.7_linux_amd64.deb
+    export GH_CLI_VERSION="2.51.0"
+    wget https://github.com/cli/cli/releases/download/v${GH_CLI_VERSION}/gh_${GH_CLI_VERSION}_linux_amd64.deb
+    dpkg -i gh_${GH_CLI_VERSION}_linux_amd64.deb
 }
 
 OS_NAME=$(uname)
@@ -138,7 +139,7 @@ if [[ "${OS_NAME}" == "Linux" ]]; then
         wget && \
         ${CLEAR_APT_LISTS:+$CLEAR_APT_LISTS} \
         python3 -m pip install --no-cache-dir --upgrade pip && \
-        python3 -m pip install --no-cache-dir --ignore-installed poetry==1.2.2 && \
+        python3 -m pip install --no-cache-dir --ignore-installed poetry==1.7.1 && \
         linux_install_gitleaks && linux_install_actionlint && linux_install_github_cli"
     fi
     eval "${SETUP_CMD}"
@@ -151,7 +152,7 @@ elif [[ "${OS_NAME}" == "Darwin" ]]; then
 
     brew install curl git git-lfs gitleaks graphviz jq make pandoc shellcheck openssl libomp actionlint unzip gh rsync
     python3 -m pip install -U pip
-    python3 -m pip install poetry==1.2.2
+    python3 -m pip install poetry==1.7.1
 
     echo "Make is currently installed as gmake"
     echo 'If you need to use it as "make", you can add a "gnubin" directory to your PATH from your bashrc like:'

@@ -255,7 +255,7 @@ def plot_baseline(param: Dict, data: DataLoader, device: str) -> None:
     checkpoint = torch.load(f"{param['dir']}/{param['pre_trained_path']}", map_location=device)
     fp32_vgg = Fp32VGG11(param["output_size"])
     fp32_vgg.load_state_dict(checkpoint)
-    baseline = torch_inference(fp32_vgg, data, param, device)
+    baseline = torch_inference(fp32_vgg, data, device)
 
     plt.plot(
         range(len(param["accuracy_test"])),
@@ -416,7 +416,6 @@ def torch_inference(
     device: str = "cpu",
     verbose: bool = False,
 ) -> float:
-
     """Returns the `top_k` accuracy.
 
     Args:
@@ -465,7 +464,6 @@ def fhe_compatibility(model: Callable, data: DataLoader) -> Callable:
 
 
 def mapping_keys(pre_trained_weights: Dict, model: nn.Module, device: str) -> nn.Module:
-
     """
     Initialize the quantized model with pre-trained fp32 weights.
 

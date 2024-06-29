@@ -1,6 +1,7 @@
 """Utils that can be re-used by other pieces of code in the module."""
 
 import enum
+import os
 import string
 from functools import partial
 from types import FunctionType
@@ -9,8 +10,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 import numpy
 import onnx
 import torch
-from concrete.fhe import ParameterSelectionStrategy
-from concrete.fhe.compilation.configuration import Configuration
+from concrete.fhe import Exactness
 from concrete.fhe.dtypes import Integer
 from sklearn.base import is_classifier, is_regressor
 
@@ -36,10 +36,9 @@ SUPPORTED_TYPES = {**SUPPORTED_FLOAT_TYPES, **SUPPORTED_INT_TYPES}
 
 MAX_BITWIDTH_BACKWARD_COMPATIBLE = 8
 
-# Use new VL with .simulate() by default once CP's multi-parameter/precision bug is fixed
-# TODO: https://github.com/zama-ai/concrete-ml-internal/issues/3856
-# Indicate if the old simulation method should be used when simulating FHE executions
-USE_OLD_VL = True
+# Indicate if the old virtual library method should be used instead of the compiler simulation
+# when simulating FHE executions
+USE_OLD_VL = False
 
 # Debug option for testing round PBS optimization
 # Setting this option to true will make quantizers "round half up"
@@ -48,6 +47,16 @@ USE_OLD_VL = True
 # which has the same behavior as torch.round -> Brevitas nets
 # should be exact compared to their Concrete ML QuantizedModule
 QUANT_ROUND_LIKE_ROUND_PBS = False
+
+# Enable input ciphertext compression
+# Note: This setting is fixed and cannot be altered by users
+# However, for internal testing purposes, we retain the capability to disable this feature
+os.environ["USE_INPUT_COMPRESSION"] = os.environ.get("USE_INPUT_COMPRESSION", "1")
+
+# Enable PBS evaluation key compression (~4x size reduction)
+# Note: This setting is fixed and cannot be altered by users
+# However, for internal testing purposes, we retain the capability to disable this feature
+os.environ["USE_KEY_COMPRESSION"] = os.environ.get("USE_KEY_COMPRESSION", "1")
 
 
 class FheMode(str, enum.Enum):
@@ -558,12 +567,15 @@ def all_values_are_floats(*values: Any) -> bool:
     return all(_is_of_dtype(value, SUPPORTED_FLOAT_TYPES) for value in values)
 
 
-def all_values_are_of_dtype(*values: Any, dtypes: Union[str, List[str]]) -> bool:
+def all_values_are_of_dtype(
+    *values: Any, dtypes: Union[str, List[str]], allow_none: bool = False
+) -> bool:
     """Indicate if all unpacked values are of the specified dtype(s).
 
     Args:
         *values (Any): The values to consider.
         dtypes (Union[str, List[str]]): The dtype(s) to consider.
+        allow_none (bool): Indicate if the values can be None.
 
     Returns:
         bool: Whether all values are of the specified dtype(s) or not.
@@ -583,36 +595,90 @@ def all_values_are_of_dtype(*values: Any, dtypes: Union[str, List[str]]) -> bool
 
         supported_dtypes[dtype] = supported_dtype
 
+    # If the values can be None, only check the other values
+    if allow_none:
+        return all(
+            _is_of_dtype(value, supported_dtypes) if value is not None else True for value in values
+        )
+
     return all(_is_of_dtype(value, supported_dtypes) for value in values)
 
 
-# Remove this function once Concrete Python fixes the multi-parameter bug with KNN
-# circuits
-# FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/3978
-def force_mono_parameter_in_configuration(configuration: Optional[Configuration], **kwargs):
-    """Force configuration to mono-parameter strategy.
-
-    If the given Configuration instance is None, build a new instance with mono-parameter and the
-    additional keyword arguments.
+def array_allclose_and_same_shape(
+    a, b, rtol: float = 1e-05, atol: float = 1e-08, equal_nan: bool = False
+) -> bool:
+    """Check if two numpy arrays are equal within a tolerances and have the same shape.
 
     Args:
-        configuration (Optional[Configuration]): The configuration to consider.
-        **kwargs: Additional parameters to use for instantiating a new Configuration instance, if
-            configuration is None.
+        a (numpy.ndarray): The first input array
+        b (numpy.ndarray): The second input array
+        rtol (float): The relative tolerance parameter
+        atol (float): The absolute tolerance parameter
+        equal_nan (bool): Whether to compare NaN’s as equal. If True, NaN’s in a will be considered
+            equal to NaN’s in b in the output array
 
     Returns:
-        configuration (Configuration): A configuration with mono-parameter strategy.
+        bool: True if the arrays have the same shape and all elements are equal within the specified
+            tolerances, False otherwise.
     """
-    assert (
-        "parameter_selection_strategy" not in kwargs
-    ), "Please do not provide a parameter_selection_strategy parameter as it will be set to MONO."
 
-    if configuration is None:
-        configuration = Configuration(
-            parameter_selection_strategy=ParameterSelectionStrategy.MONO, **kwargs
-        )
+    assert isinstance(a, numpy.ndarray)
+    assert isinstance(b, numpy.ndarray)
 
-    else:
-        configuration.parameter_selection_strategy = ParameterSelectionStrategy.MONO
+    return a.shape == b.shape and numpy.allclose(a, b, rtol, atol, equal_nan)
 
-    return configuration
+
+def process_rounding_threshold_bits(rounding_threshold_bits):
+    """Check and process the rounding_threshold_bits parameter.
+
+    Args:
+        rounding_threshold_bits (Union[None, int, Dict[str, Union[str, int]]]): Defines precision
+            rounding for model accumulators. Accepts None, an int, or a dict.
+            The dict can specify 'method' (fhe.Exactness.EXACT or fhe.Exactness.APPROXIMATE)
+            and 'n_bits' ('auto' or int)
+
+    Returns:
+        Dict[str, Union[str, int]]: Processed rounding_threshold_bits dictionary.
+
+    Raises:
+        NotImplementedError: If 'auto' rounding is specified but not implemented.
+        ValueError: If an invalid type or value is provided for rounding_threshold_bits.
+        KeyError: If the dict contains keys other than 'n_bits' and 'method'.
+    """
+    n_bits_rounding: Union[None, str, int] = None
+    method: Exactness = Exactness.EXACT
+
+    # Only process if rounding_threshold_bits is not None
+    if rounding_threshold_bits is not None:
+        if isinstance(rounding_threshold_bits, int):
+            n_bits_rounding = rounding_threshold_bits
+        elif isinstance(rounding_threshold_bits, dict):
+            valid_keys = {"n_bits", "method"}
+            if not valid_keys.issuperset(rounding_threshold_bits.keys()):
+                raise KeyError(
+                    f"Invalid keys in rounding_threshold_bits. "
+                    f"Allowed keys are {sorted(valid_keys)}."
+                )
+            n_bits_rounding = rounding_threshold_bits.get("n_bits")
+            if n_bits_rounding == "auto":
+                raise NotImplementedError("Automatic rounding is not implemented yet.")
+            if not isinstance(n_bits_rounding, int):
+                raise ValueError("n_bits must be an integer.")
+            method = rounding_threshold_bits.get("method", method)
+            if not isinstance(method, Exactness):
+                method_str = method.upper()
+                if method_str in ["EXACT", "APPROXIMATE"]:
+                    method = Exactness[method_str]
+                else:
+                    raise ValueError(
+                        f"{method_str} is not a valid method. Must be one of EXACT, APPROXIMATE."
+                    )
+        else:
+            raise ValueError("Invalid type for rounding_threshold_bits. Must be int or dict.")
+
+        if n_bits_rounding is not None and not 2 <= n_bits_rounding <= 8:
+            raise ValueError("n_bits_rounding must be between 2 and 8 inclusive.")
+
+        rounding_threshold_bits = {"n_bits": n_bits_rounding, "method": method}
+
+    return rounding_threshold_bits

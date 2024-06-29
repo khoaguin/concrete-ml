@@ -20,7 +20,16 @@ from .quantizers import (
     UniformQuantizationParameters,
 )
 
-ONNXOpInputOutputType = Union[numpy.ndarray, QuantizedArray, None]
+# pylint: disable=too-many-lines
+
+ONNXOpInputOutputType = Union[
+    numpy.ndarray,
+    QuantizedArray,
+    None,
+    bool,
+    int,
+    float,
+]
 
 ALL_QUANTIZED_OPS: Set[Type] = set()
 
@@ -228,14 +237,14 @@ class QuantizedOp:
         metadata["_input_idx_to_params_name"] = self._input_idx_to_params_name
         metadata["_params_that_are_onnx_inputs"] = self._params_that_are_onnx_inputs
         metadata["_params_that_are_onnx_var_inputs"] = self._params_that_are_onnx_var_inputs
-        metadata[
-            "_params_that_are_required_onnx_inputs"
-        ] = self._params_that_are_required_onnx_inputs
+        metadata["_params_that_are_required_onnx_inputs"] = (
+            self._params_that_are_required_onnx_inputs
+        )
         metadata["_has_attr"] = self._has_attr
         metadata["_inputs_not_quantized"] = self._inputs_not_quantized
-        metadata[
-            "quantize_inputs_with_model_outputs_precision"
-        ] = self.quantize_inputs_with_model_outputs_precision
+        metadata["quantize_inputs_with_model_outputs_precision"] = (
+            self.quantize_inputs_with_model_outputs_precision
+        )
         metadata["produces_graph_output"] = self.produces_graph_output
         metadata["produces_raw_output"] = self.produces_raw_output
         metadata["error_tracker"] = self.error_tracker
@@ -865,14 +874,23 @@ class QuantizedMixingOp(QuantizedOp, is_utility=True):
     Mixing operators cannot be fused to TLUs.
     """
 
-    lsbs_to_remove: Optional[int] = None
-    rounding_threshold_bits: Optional[int] = None
+    lsbs_to_remove: Optional[Union[int, dict]] = None
+    rounding_threshold_bits: Union[None, int, Dict[str, Union[str, int]]] = None
 
-    def __init__(self, *args, rounding_threshold_bits: Optional[int] = None, **kwargs) -> None:
+    def __init__(
+        self,
+        *args,
+        rounding_threshold_bits: Union[None, int, Dict[str, Union[str, int]]] = None,
+        **kwargs,
+    ) -> None:
         """Initialize quantized ops parameters plus specific parameters.
 
         Args:
-            rounding_threshold_bits (Optional[int]): Number of bits to round to.
+            rounding_threshold_bits (Union[None, int, Dict[str, Union[str, int]]]): if not None,
+                every accumulators in the model are rounded down to the given bits of precision.
+                Can be an int or a dictionary with keys 'method' and 'n_bits', where 'method' is
+                either fhe.Exactness.EXACT or fhe.Exactness.APPROXIMATE, and 'n_bits' is either
+                'auto' or an int.
             *args: positional argument to pass to the parent class.
             **kwargs: named argument to pass to the parent class.
         """
@@ -933,39 +951,68 @@ class QuantizedMixingOp(QuantizedOp, is_utility=True):
         )
 
     def cnp_round(
-        self, x: Union[numpy.ndarray, fhe.tracing.Tracer], calibrate_rounding: bool
+        self,
+        x: Union[numpy.ndarray, fhe.tracing.Tracer],
+        calibrate_rounding: bool,
+        rounding_operation_id: Optional[str] = "single_rounding_op",
     ) -> numpy.ndarray:
         """Round the input array to the specified number of bits.
 
         Args:
             x (Union[numpy.ndarray, fhe.tracing.Tracer]): The input array to be rounded.
             calibrate_rounding (bool): Whether to calibrate the rounding
-                (compute the lsbs_to_remove)
+                (compute the lsbs_to_remove).
+            rounding_operation_id (Optional[str]): The identifier for a specific rounding
+                operation in a quantized operation. Used to create and access the
+                lsbs_to_remove value in the dictionary. Defaults to "single_rounding_op"
+                if not provided.
 
         Returns:
             numpy.ndarray: The rounded array.
         """
+        # Ensure lsbs_to_remove is initialized as a dictionary
+        if not hasattr(self, "lsbs_to_remove") or not isinstance(self.lsbs_to_remove, dict):
+            self.lsbs_to_remove = {}
 
-        # Rounding is applied only if specified by user
-        if self.rounding_threshold_bits is not None:
-            if calibrate_rounding:
-                assert_true(
-                    not isinstance(x, fhe.tracing.Tracer),
-                    "Can't compute lsbs_to_remove at compilation time.",
-                )
-                assert_true(
-                    self.lsbs_to_remove is None,
-                    "Rounding has already been calibrated.",
-                )
+        n_bits = None
+        exactness = fhe.Exactness.EXACT
 
-                current_n_bits_accumulator = compute_bits_precision(x)
-                self.lsbs_to_remove = current_n_bits_accumulator - self.rounding_threshold_bits
+        if isinstance(self.rounding_threshold_bits, dict):
+            n_bits = self.rounding_threshold_bits.get("n_bits", None)
+            exactness = self.rounding_threshold_bits.get("method", exactness)
+        # PoT is replacing inplace the rounding_threshold_bits to an int
+        elif isinstance(self.rounding_threshold_bits, int):
+            n_bits = self.rounding_threshold_bits
+
+        if n_bits is not None and calibrate_rounding:
+            # Compute lsbs_to_remove only when calibration is True
+            current_n_bits_accumulator = compute_bits_precision(x)
 
             # mypy
-            assert self.lsbs_to_remove is not None
+            assert isinstance(n_bits, int)
+            computed_lsbs_to_remove = current_n_bits_accumulator - n_bits
 
-            # Apply rounding if needed
-            if self.lsbs_to_remove > 0:
-                x = fhe.round_bit_pattern(x, lsbs_to_remove=self.lsbs_to_remove)
+            assert_true(
+                not isinstance(x, fhe.tracing.Tracer),
+                "Can't compute lsbs_to_remove at compilation time.",
+            )
 
+            # Update the lsbs_to_remove value in the dictionary
+            self.lsbs_to_remove[rounding_operation_id] = max(
+                self.lsbs_to_remove.get(rounding_operation_id, 0),
+                computed_lsbs_to_remove,
+            )
+
+        # Rounding logic
+        lsbs_value = self.lsbs_to_remove.get(rounding_operation_id, 0)
+
+        # mypy
+        assert isinstance(lsbs_value, int)
+
+        if lsbs_value > 0:
+            # Rounding to low bit-width with approximate can cause issues with overflow protection
+            # FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/4345
+            x = fhe.round_bit_pattern(
+                x, lsbs_to_remove=lsbs_value, exactness=exactness, overflow_protection=False
+            )
         return x

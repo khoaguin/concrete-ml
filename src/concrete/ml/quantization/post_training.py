@@ -5,9 +5,11 @@ from typing import Dict, List, Optional, Set, Tuple, Type, Union, cast
 
 import numpy
 import onnx
+from concrete.fhe.tracing import Tracer
 from onnx import numpy_helper
 
 from ..common.debugging import assert_true
+from ..common.utils import process_rounding_threshold_bits
 from ..onnx.onnx_utils import ONNX_OPS_TO_NUMPY_IMPL, get_attribute, get_op_type
 from ..onnx.ops_impl import RawOpOutput
 from ..torch.numpy_module import NumpyModule
@@ -22,6 +24,101 @@ from .quantized_module import QuantizedModule
 from .quantized_module_passes import PowerOfTwoScalingRoundPBSAdapter
 from .quantized_ops import QuantizedBrevitasQuant
 from .quantizers import QuantizationOptions, QuantizedArray, UniformQuantizer
+
+# pylint: disable=too-many-lines
+
+
+def _inspect_tree_n_bits(n_bits):
+    """Validate the 'n_bits' parameter for tree-based models.
+
+    This function checks whether 'n_bits' is a valid integer or dictionary.
+    - If 'n_bits' is an integer, it must be a non-null positive, its value is assigned to
+        'op_inputs' and 'op_leaves' bits
+    - If it is a dictionary, it should contain integer values for keys 'op_leaves' and 'op_inputs',
+        where 'op_leaves' should not exceed 'op_inputs'.
+
+    The function raises a ValueError with a descriptive message if 'n_bits' does not meet
+    these criteria.
+
+    Args:
+        n_bits (int, Dict[str, int]): number of bits for quantization, can be a single value or
+            a dictionary with the following keys :
+            - "op_inputs" (mandatory): number of bits to quantize the input values
+            - "op_leaves" (optional): number of bits to quantize the leaves, must be less than or
+                equal to 'op_inputs. defaults to the value of 'op_inputs if not specified.
+
+    Raises:
+        ValueError: If 'n_bits' does not conform to the required format or value constraints.
+    """
+
+    detailed_message = (
+        "Invalid 'n_bits', either pass a strictly positive integer or a dictionary containing "
+        "integer values for the following keys:\n"
+        "- 'op_inputs' (mandatory): number of bits to quantize the input values\n"
+        "- 'op_leaves' (optional): number of bits to quantize the leaves, must be less than or "
+        "equal to 'op_inputs'. Defaults to the value of 'op_inputs' if not specified."
+        "When using a single integer for n_bits, its value is assigned to 'op_inputs' and "
+        "'op_leaves' bits.\n"
+    )
+
+    error_message = ""
+
+    if isinstance(n_bits, int):
+        if n_bits <= 0:
+            error_message = "n_bits must be a strictly positive integer"
+    elif isinstance(n_bits, dict):
+        if "op_inputs" not in n_bits.keys():
+            error_message = "Invalid keys in `n_bits` dictionary. The key 'op_inputs' is mandatory"
+        elif set(n_bits.keys()) - {"op_leaves", "op_inputs"}:
+            error_message = (
+                "Invalid keys in 'n_bits' dictionary. Only 'op_inputs' (mandatory) and 'op_leaves' "
+                "(optional) are allowed"
+            )
+        elif not all(isinstance(value, int) and value > 0 for value in n_bits.values()):
+            error_message = "All values in 'n_bits' dictionary must be strictly positive integers"
+
+        elif n_bits.get("op_leaves", 0) > n_bits.get("op_inputs", 0):
+            error_message = "'op_leaves' must be less than or equal to 'op_inputs'"
+    else:
+        error_message = "n_bits must be either an integer or a dictionary"
+
+    if len(error_message) > 0:
+        raise ValueError(
+            f"{error_message}. Got '{type(n_bits)}' and '{n_bits}' value.\n{detailed_message}"
+        )
+
+
+# Find a better naming to describe leaf quantization in tree-based models
+# FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/4258
+def _get_n_bits_dict_trees(n_bits: Union[int, Dict[str, int]]) -> Dict[str, int]:
+    """Convert the n_bits parameter into a proper dictionary for tree based-models.
+
+    Args:
+        n_bits (int, Dict[str, int]): number of bits for quantization, can be a single value or
+            a dictionary with the following keys :
+            - "op_inputs" (mandatory): number of bits to quantize the input values
+            - "op_leaves" (optional): number of bits to quantize the leaves, must be less than or
+                equal to 'op_inputs'. defaults to the value of "op_inputs" if not specified.
+
+            When using a single integer for n_bits, its value is assigned to "op_inputs" and
+            "op_leaves" bits.
+
+    Returns:
+        n_bits_dict (Dict[str, int]): A dictionary properly representing the number of bits to use
+            for quantization.
+    """
+
+    _inspect_tree_n_bits(n_bits)
+
+    # If a single integer is passed, we use a default value for the model's input and leaves
+    if isinstance(n_bits, int):
+        return {"op_inputs": n_bits, "op_leaves": n_bits}
+
+    # Default 'op_leaves' to 'op_inputs' if not specified
+    if "op_leaves" not in n_bits:
+        n_bits["op_leaves"] = n_bits["op_inputs"]
+
+    return n_bits
 
 
 def get_n_bits_dict(n_bits: Union[int, Dict[str, int]]) -> Dict[str, int]:
@@ -116,28 +213,30 @@ class ONNXConverter:
             of the network's inputs. "op_inputs" and "op_weights" both control the quantization for
             inputs and weights of all layers.
         numpy_model (NumpyModule): Model in numpy.
-        rounding_threshold_bits (int): if not None, every accumulators in the model are rounded down
-            to the given bits of precision
+        rounding_threshold_bits (Union[None, int, Dict[str, Union[str, int]]]): Defines precision
+            rounding for model accumulators. Accepts None, an int, or a dict.
+            The dict can specify 'method' (fhe.Exactness.EXACT or fhe.Exactness.APPROXIMATE)
+            and 'n_bits' ('auto' or int)
     """
 
     quant_ops_dict: Dict[str, Tuple[Tuple[str, ...], QuantizedOp]]
     n_bits: Dict[str, int]
     quant_params: Dict[str, numpy.ndarray]
     numpy_model: NumpyModule
-    rounding_threshold_bits: Optional[int]
+    rounding_threshold_bits: Union[None, int, Dict[str, Union[str, int]]]
 
     def __init__(
         self,
         n_bits: Union[int, Dict],
         numpy_model: NumpyModule,
-        rounding_threshold_bits: Optional[int] = None,
+        rounding_threshold_bits: Union[None, int, Dict[str, Union[str, int]]] = None,
     ):
         self.quant_ops_dict = {}
 
         self.n_bits = get_n_bits_dict(n_bits)
         self.quant_params = {}
         self.numpy_model = numpy_model
-        self.rounding_threshold_bits = rounding_threshold_bits
+        self.rounding_threshold_bits = process_rounding_threshold_bits(rounding_threshold_bits)
 
     @property
     def n_bits_model_outputs(self):
@@ -305,7 +404,9 @@ class ONNXConverter:
         )
 
     @abstractmethod
-    def _process_initializer(self, n_bits: int, values: numpy.ndarray) -> QuantizedArray:
+    def _process_initializer(
+        self, n_bits: int, values: Union[numpy.ndarray, float, int, bool]
+    ) -> Union[QuantizedArray, RawOpOutput]:
         """Transform a constant tensor according to the model conversion mode.
 
         The values supplied are floating point values that will be quantized.
@@ -315,7 +416,8 @@ class ONNXConverter:
             values (numpy.ndarray): Float values that initialize this tensor
 
         Returns:
-            QuantizedArray: a quantized tensor with integer values on n_bits bits
+            Union[QuantizedArray, RawOpOutput]: a quantized tensor with integer
+                values on n_bits bits
         """
 
     @abstractmethod
@@ -423,10 +525,6 @@ class ONNXConverter:
 
             quantized_op_class = ONNX_OPS_TO_QUANTIZED_IMPL[op_type]
 
-            # Add rounding_threshold_bits to the attributes if available in quantized_op_class
-            if issubclass(quantized_op_class, QuantizedMixingOp):
-                attributes.update({"rounding_threshold_bits": self.rounding_threshold_bits})
-
             # All inputs, allow optional constants (they become None)
             # Note that input of a node can be duplicated, e.g., (%a, %a, %b)
             curr_inputs = [
@@ -444,14 +542,13 @@ class ONNXConverter:
                         curr_cst_inputs[input_idx] = value
                     else:
                         # Initializers are ndarray or scalar
-                        assert value is not None
-                        assert isinstance(value, numpy.ndarray) or numpy.isscalar(value)
+                        assert isinstance(value, (numpy.ndarray, float, int, bool))
                         curr_cst_inputs[input_idx] = self._process_initializer(
                             self.n_bits_op_weights, value
                         )
                 else:
                     # Initializers are ndarray or scalar
-                    assert isinstance(value, numpy.ndarray) or numpy.isscalar(value)
+                    assert isinstance(value, (numpy.ndarray, float, int, bool))
                     curr_cst_inputs[input_idx] = value
 
             has_variable_inputs = (len(curr_inputs) - len(curr_cst_inputs)) > 0
@@ -478,6 +575,12 @@ class ONNXConverter:
 
             # If we depend on a variable input use the quantized version of the operator
             if has_variable_inputs:
+
+                # Add rounding_threshold_bits to the attributes if available in quantized_op_class
+                # rounding_thresholds_bits only applies to QuantizedOp for now so we can't use them
+                # if we use the original operator on float (ops_impl.py)
+                if issubclass(quantized_op_class, QuantizedMixingOp):
+                    attributes.update({"rounding_threshold_bits": self.rounding_threshold_bits})
 
                 assert_true(
                     op_type in ONNX_OPS_TO_QUANTIZED_IMPL,
@@ -584,9 +687,8 @@ class ONNXConverter:
         Following https://arxiv.org/abs/1712.05877 guidelines.
 
         Args:
-            *calibration_data (numpy.ndarray):  Data that will be used to compute the bounds,
-                                                scales and zero point values for every quantized
-                                                object.
+            calibration_data (numpy.ndarray):  Data that will be used to compute the bounds,
+                scales and zero point values for every quantized object.
 
         Returns:
             QuantizedModule: Quantized numpy module
@@ -710,13 +812,6 @@ class ONNXConverter:
                 # use that op's quantization options (ensures matching options that allows
                 # the optimization to take place)
                 opts = layer_using_input[inp_idx][0].input_quant_opts
-                for layer in layer_using_input[inp_idx][1:]:
-                    opts_k = layer.input_quant_opts
-                    assert_true(
-                        opts.is_equal(opts_k),
-                        "Multiple quantizers "
-                        "applied to the same input must have the same quantization options",
-                    )
 
                 q_input_list.append(QuantizedArray(opts.n_bits, val, options=opts).quantizer)
 
@@ -741,8 +836,12 @@ class PostTrainingAffineQuantization(ONNXConverter):
                                         - op_weights: learned parameters or constants in the network
                                         - model_outputs: final model output quantization bits
         numpy_model (NumpyModule):      Model in numpy.
-        rounding_threshold_bits (int): if not None, every accumulators in the model are rounded down
-            to the given bits of precision
+        rounding_threshold_bits (Union[None, int, Dict[str, Union[str, int]]]): if not None, every
+                                        accumulators in the model are rounded down to the given
+                                        bits of precision. Can be an int or a dictionary with keys
+                                        'method' and 'n_bits', where 'method' is either
+                                        fhe.Exactness.EXACT or fhe.Exactness.APPROXIMATE, and
+                                        'n_bits' is either 'auto' or an int.
         is_signed:                      Whether the weights of the layers can be signed.
                                         Currently, only the weights can be signed.
 
@@ -775,7 +874,9 @@ class PostTrainingAffineQuantization(ONNXConverter):
             True, quantized_op, *calibration_data, quantizers=quantizers
         )
 
-    def _process_initializer(self, n_bits: int, values: numpy.ndarray):
+    def _process_initializer(
+        self, n_bits: int, values: Union[numpy.ndarray, float, int, bool]
+    ) -> Union[QuantizedArray, RawOpOutput]:
         """Quantize a network constant tensor (a weights tensor).
 
         The values supplied are floating point values that will be quantized.
@@ -785,13 +886,14 @@ class PostTrainingAffineQuantization(ONNXConverter):
             values (numpy.ndarray): Float values that initialize this tensor
 
         Returns:
-            QuantizedArray: a quantized tensor with integer values on n_bits bits
+            Union[QuantizedArray, RawOpOutput]: a quantized tensor with integer
+                values on n_bits bits
         """
 
         if isinstance(values, numpy.ndarray) and numpy.issubdtype(values.dtype, numpy.integer):
             return values.view(RawOpOutput)
-
-        assert isinstance(values, (numpy.ndarray, float))
+        if not isinstance(values, (numpy.ndarray, Tracer)):
+            values = numpy.array(values)
         is_signed = is_symmetric = self._check_distribution_is_symmetric_around_zero(values)
 
         return QuantizedArray(
@@ -900,7 +1002,9 @@ class PostTrainingQATImporter(ONNXConverter):
             False, quantized_op, *calibration_data, quantizers=quantizers
         )
 
-    def _process_initializer(self, n_bits: int, values: numpy.ndarray):
+    def _process_initializer(
+        self, n_bits: int, values: Union[numpy.ndarray, float, int, bool]
+    ) -> Union[QuantizedArray, RawOpOutput]:
         """Process an already quantized weight tensor.
 
         The values supplied are in floating point, but are discrete, in the sense
@@ -913,8 +1017,8 @@ class PostTrainingQATImporter(ONNXConverter):
             values (numpy.ndarray): Discrete float values that initialize this tensor
 
         Returns:
-            QuantizedArray: a quantized tensor with integer values on n_bits bits and with alpha as
-                the scaling factor.
+            Union[QuantizedArray, RawOpOutput]: a quantized tensor with integer values on
+                n_bits bits and with alpha as the scaling factor.
         """
 
         # Assume that integer initializer op inputs are raw values that should not be quantized

@@ -34,7 +34,7 @@ def compile_model(
     models_dir.mkdir(exist_ok=True)
     model_dir = models_dir / model_name
     print(f"Saving to {model_dir}")
-    via_mlir = bool(int(os.environ.get("VIA_MLIR", 0)))
+    via_mlir = bool(int(os.environ.get("VIA_MLIR", 1)))
     hybrid_model.save_and_clear_private_info(model_dir, via_mlir=via_mlir)
 
 
@@ -43,7 +43,13 @@ def module_names_parser(string: str) -> List[str]:
 
 
 if __name__ == "__main__":
-    arg_parser = argparse.ArgumentParser()
+    arg_parser = argparse.ArgumentParser(description="Showcase for the hybrid model converter.")
+    arg_parser.add_argument(
+        "--model-name",
+        default="gpt2",
+        type=str,
+        help="The name of the model to compile. Default is 'gpt2'.",
+    )
     arg_parser.add_argument(
         "--module-names",
         dest="module_names",
@@ -59,14 +65,16 @@ Examples for GPT-2 model:
 These names might vary according to your model.
 """,
     )
-    module_names = arg_parser.parse_args().module_names
+
+    args = arg_parser.parse_args()
+    module_names = args.module_names
+    model_name = args.model_name
 
     # Compilation should be done on CPU
     device = "cpu"
     print(f"Using device: {device}")
 
     # Get GPT2 from Hugging Face
-    model_name = "gpt2"
     model_name_no_special_char = model_name.replace("/", "_")
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModelForCausalLM.from_pretrained(
@@ -93,7 +101,9 @@ These names might vary according to your model.
     max_context_size = 20
     num_samples = 50
 
-    dataset = load_dataset("wikipedia", "20220301.en")
+    dataset = load_dataset(
+        "wikimedia/wikipedia", "20231101.en", revision="b04c8d1ceb2f5cd4588862100d08de323dccfbaa"
+    )
     print(model)
     models_dir = Path(__file__).parent / os.environ.get("MODELS_DIR_NAME", "compiled_models")
     models_dir.mkdir(exist_ok=True)

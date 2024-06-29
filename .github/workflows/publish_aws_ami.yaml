@@ -20,11 +20,10 @@ jobs:
     steps:
 
       # Just a way to check that if triggered by workflow_dispatch the tag exists
-      # TODO: We still need to check that it matches a version tag
+      # FIXME: We still need to check that it matches a version tag
       # This won't work on automatically triggered based on release
       - name: Checkout Concrete ML Repository
-        if: ${{ github.event_name == 'workflow_dispatch' }}
-        uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
         with:
           ref: ${{ inputs.version || github.ref_name}}
           fetch-depth: 1
@@ -33,15 +32,14 @@ jobs:
 
       # To use the files and all
       - name: Checkout Concrete ML Repository
-        if: ${{ github.event_name == 'workflow_dispatch' }}
-        uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
         with:
           fetch-depth: 1
           lfs: false
           path: "concrete-ml-latest"
 
       - name: Checkout Slab Repository
-        uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
         with:
           repository: "zama-ai/slab"
           path: "slab"
@@ -74,7 +72,7 @@ jobs:
 
           SIGNATURE="$(bash slab/scripts/hmac_calculator.sh payload.json '${{ secrets.JOB_SECRET }}')"
 
-          curl -v -k \
+          curl --fail-with-body -v -k \
           -H "Content-Type: application/json" \
           -H "X-Slab-Repository: ${{ github.repository }}" \
           -H "X-Slab-Command: build_aws_ami" \
@@ -85,7 +83,7 @@ jobs:
       - name: Slack Notification
         if: ${{ always() }}
         continue-on-error: true
-        uses: rtCamp/action-slack-notify@b24d75fe0e728a4bf9fc42ee217caa686d141ee8
+        uses: rtCamp/action-slack-notify@4e5fb42d249be6a45a298f3c9543b111b02f7907
         env:
           SLACK_CHANNEL: ${{ secrets.SLACK_CHANNEL }}
           SLACK_ICON: https://pbs.twimg.com/profile_images/1274014582265298945/OjBKP9kn_400x400.png

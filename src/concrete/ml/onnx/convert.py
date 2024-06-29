@@ -1,8 +1,10 @@
 """ONNX conversion related code."""
 
+import inspect
 import tempfile
+import warnings
 from pathlib import Path
-from typing import Callable, Tuple, Union
+from typing import Callable, Optional, Tuple, Union
 
 import numpy
 import onnx
@@ -10,7 +12,13 @@ import onnxoptimizer
 import torch
 from onnx import checker, helper
 
-from .onnx_utils import IMPLEMENTED_ONNX_OPS, execute_onnx_with_numpy, get_op_type
+from ..common.debugging import assert_true
+from .onnx_utils import (
+    IMPLEMENTED_ONNX_OPS,
+    execute_onnx_with_numpy,
+    execute_onnx_with_numpy_trees,
+    get_op_type,
+)
 
 OPSET_VERSION_FOR_ONNX_EXPORT = 14
 
@@ -132,20 +140,32 @@ def get_equivalent_numpy_forward_from_torch(
     )
     use_tempfile: bool = output_onnx_file is None
 
+    arguments = list(inspect.signature(torch_module.forward).parameters)
+
     # Export to ONNX
     torch.onnx.export(
         torch_module,
         dummy_input,
         str(output_onnx_file_path),
         opset_version=OPSET_VERSION_FOR_ONNX_EXPORT,
+        input_names=arguments,
     )
     equivalent_onnx_model = onnx.load_model(str(output_onnx_file_path))
+
+    # Check if the inputs are present in the model's graph
+    for input_name in arguments:
+        assert_true(
+            any(input_name == node.name for node in equivalent_onnx_model.graph.input),
+            f"Input '{input_name}' is missing in the ONNX graph after export. "
+            "Verify the forward pass for issues.",
+        )
+
     # Remove the tempfile if we used one
     if use_tempfile:
         output_onnx_file_path.unlink()
 
     equivalent_numpy_forward, equivalent_onnx_model = get_equivalent_numpy_forward_from_onnx(
-        equivalent_onnx_model, check_model=True
+        equivalent_onnx_model
     )
     with output_onnx_file_path.open("wb") as file:
         file.write(equivalent_onnx_model.SerializeToString())
@@ -156,10 +176,7 @@ def get_equivalent_numpy_forward_from_torch(
     )
 
 
-def get_equivalent_numpy_forward_from_onnx(
-    onnx_model: onnx.ModelProto,
-    check_model: bool = True,
-) -> Tuple[Callable[..., Tuple[numpy.ndarray, ...]], onnx.ModelProto]:
+def preprocess_onnx_model(onnx_model: onnx.ModelProto, check_model: bool) -> onnx.ModelProto:
     """Get the numpy equivalent forward of the provided ONNX model.
 
     Args:
@@ -173,11 +190,20 @@ def get_equivalent_numpy_forward_from_onnx(
             model to numpy.
 
     Returns:
-        Callable[..., Tuple[numpy.ndarray, ...]]: The function that will execute
-            the equivalent numpy function.
+        onnx.ModelProto: The preprocessed ONNX model.
     """
-    if check_model:
-        checker.check_model(onnx_model)
+
+    # All onnx models should be checked, "check_model" parameter must be removed
+    # FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/4157
+    if not check_model:  # pragma: no cover
+        warnings.simplefilter("always")
+        warnings.warn(
+            "`check_model` parameter should always be set to True, to ensure proper onnx model "
+            "verification and avoid bypassing essential onnx model validation checks.",
+            category=UserWarning,
+            stacklevel=2,
+        )
+
     checker.check_model(onnx_model)
 
     # Optimize ONNX graph
@@ -192,6 +218,7 @@ def get_equivalent_numpy_forward_from_onnx(
     ]
     equivalent_onnx_model = onnxoptimizer.optimize(onnx_model, onnx_passes)
     checker.check_model(equivalent_onnx_model)
+
     # Custom optimization
     # ONNX optimizer does not optimize Mat-Mult + Bias pattern into GEMM if the input isn't a matrix
     # We manually do the optimization for this case
@@ -208,7 +235,62 @@ def get_equivalent_numpy_forward_from_onnx(
             f"Available ONNX operators: {', '.join(sorted(IMPLEMENTED_ONNX_OPS))}"
         )
 
+    return equivalent_onnx_model
+
+
+def get_equivalent_numpy_forward_from_onnx(
+    onnx_model: onnx.ModelProto,
+    check_model: bool = True,
+) -> Tuple[Callable[..., Tuple[numpy.ndarray, ...]], onnx.ModelProto]:
+    """Get the numpy equivalent forward of the provided ONNX model.
+
+    Args:
+        onnx_model (onnx.ModelProto): the ONNX model for which to get the equivalent numpy
+            forward.
+        check_model (bool): set to True to run the onnx checker on the model.
+            Defaults to True.
+
+    Returns:
+        Callable[..., Tuple[numpy.ndarray, ...]]: The function that will execute
+            the equivalent numpy function.
+    """
+
+    equivalent_onnx_model = preprocess_onnx_model(onnx_model, check_model)
+
     # Return lambda of numpy equivalent of onnx execution
     return (
         lambda *args: execute_onnx_with_numpy(equivalent_onnx_model.graph, *args)
+    ), equivalent_onnx_model
+
+
+def get_equivalent_numpy_forward_from_onnx_tree(
+    onnx_model: onnx.ModelProto,
+    check_model: bool = True,
+    lsbs_to_remove_for_trees: Optional[Tuple[int, int]] = None,
+) -> Tuple[Callable[..., Tuple[numpy.ndarray, ...]], onnx.ModelProto]:
+    """Get the numpy equivalent forward of the provided ONNX model for tree-based models only.
+
+    Args:
+        onnx_model (onnx.ModelProto): the ONNX model for which to get the equivalent numpy
+            forward.
+        check_model (bool): set to True to run the onnx checker on the model.
+            Defaults to True.
+        lsbs_to_remove_for_trees (Optional[Tuple[int, int]]): This parameter is exclusively used for
+            optimizing tree-based models. It contains the values of the least significant bits to
+            remove during the tree traversal, where the first value refers to the first comparison
+            (either "less" or "less_or_equal"), while the second value refers to the "Equal"
+            comparison operation. Default to None, as it is not applicable to other types of models.
+
+    Returns:
+        Tuple[Callable[..., Tuple[numpy.ndarray, ...]], onnx.ModelProto]: The function that will
+            execute the equivalent numpy function.
+    """
+
+    equivalent_onnx_model = preprocess_onnx_model(onnx_model, check_model)
+
+    # Return lambda of numpy equivalent of onnx execution
+    return (
+        lambda *args: execute_onnx_with_numpy_trees(
+            equivalent_onnx_model.graph, lsbs_to_remove_for_trees, *args
+        )
     ), equivalent_onnx_model

@@ -5,22 +5,27 @@ set -e
 USE_PIP_WHEEL='false'
 TEST_CODEBLOCKS='false'
 NO_FLAKY='false'
+VERSION=''
 
 while [ -n "$1" ]
 do
    case "$1" in
         "--wheel" )
             USE_PIP_WHEEL='true'
-            shift
-            CONCRETE_NUMPY="$1"
             ;;
         
         "--codeblocks" )
             TEST_CODEBLOCKS='true'
             ;;
+
         "--noflaky" )
             NO_FLAKY='true'
             ;;
+
+        "--version" )
+            shift
+            VERSION="$1"
+            ;;   
    esac
    shift
 done
@@ -44,12 +49,13 @@ source "${PYPI_VENV}/bin/activate"
 # Investigate a better way of managing these dependencies 
 # FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/2685
 python -m pip install --upgrade pip
-python -m pip install pytest==7.1.1 pandas==1.5.3 tensorflow==2.12.0 tf2onnx==1.13.0 torchvision==0.14.1
+python -m pip install pytest==7.4.1 pandas==2.0.3 tensorflow==2.12.0 tf2onnx==1.15.0 torchvision==0.14.1 transformers==4.40.0
 
 # Install additional pytest plugins
-python -m pip install pytest-xdist==2.5.0
-python -m pip install pytest-randomly==3.12.0
+python -m pip install pytest-xdist==3.3.1
+python -m pip install pytest-randomly==3.15.0
 python -m pip install pytest-repeat==0.9.1
+python -m pip install pytest-subtests==0.11.0
 
 if ${USE_PIP_WHEEL}; then
     # Delete the directory where the pypi wheel file will be created (if it already exists)
@@ -58,13 +64,16 @@ if ${USE_PIP_WHEEL}; then
     # Build the wheel file
     poetry build -f wheel
 
-    # Install the dependencies as PyPI would do using the wheel file, inclusing the current
-    # Concrete-Numpy RC version
+    # Install the dependencies as PyPI would do using the wheel file as well as the given
+    # Concrete-Python version
     PYPI_WHEEL=$(find dist -type f -name "*.whl")
-    python -m pip install "${PYPI_WHEEL}"
-    python -m pip install "${CONCRETE_NUMPY}"
+    python -m pip install --extra-index-url https://pypi.zama.ai/cpu "${PYPI_WHEEL}"
 else
-    python -m pip install concrete-ml
+    if [ -z "${VERSION}" ]; then
+        python -m pip install concrete-ml
+    else
+        python -m pip install concrete-ml=="${VERSION}"
+    fi
 fi
 
 # If codeblocks are checked, install the pytest codeblock plugin first
@@ -77,10 +86,11 @@ if ${TEST_CODEBLOCKS}; then
 elif ${NO_FLAKY}; then
     make pytest_no_flaky
 
-# Else, intall the pytest coverage plugin and run 'pytest' 
+# Else, intall the pytest coverage plugin and run 'pytest_internal_parallel' (instead of `pytest`
+# since we don't want to check for coverage here)
 else
-    python -m pip install pytest-cov==3.0.0
-    make pytest
+    python -m pip install pytest-cov==4.1.0
+    make pytest_internal_parallel
 fi
 
 # Delete the virtual env directory

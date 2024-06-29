@@ -12,21 +12,25 @@ CONCRETE_PACKAGE_PATH=$(SRC_DIR)/concrete
 COUNT?=1
 RANDOMLY_SEED?=$$RANDOM
 PYTEST_OPTIONS:=
-POETRY_VERSION:=1.2.2
-APIDOCS_OUTPUT?="./docs/developer-guide/api"
+POETRY_VERSION:=1.7.1
+APIDOCS_OUTPUT?="./docs/references/api"
 OPEN_PR="true"
 
-# If one wants to force the installation of a given rc version
+# Force the installation of a Concrete Python version, which is very useful with nightly versions
 # /!\ WARNING /!\: This version should NEVER be a wildcard as it might create some
 # issues when trying to run it in the future.
-CP_VERSION_SPEC_FOR_RC="concrete-python==2.2.0"
+CONCRETE_PYTHON_VERSION="concrete-python==2.7.0"
 
-# If one wants to use the last RC version
-# CP_VERSION_SPEC_FOR_RC="$$(poetry run python \
+# Force the installation of Concrete Python's latest version, release-candidates included
+# CONCRETE_PYTHON_VERSION="$$(poetry run python \
 # ./script/make_utils/pyproject_version_parser_helper.py \
 # --pyproject-toml-file pyproject.toml \
 # --get-pip-install-spec-for-dependency concrete-python)"
 
+# At the end of the command, we currently need to force an 'import skorch' in Python in order to 
+# avoid an obscure bug that led to all pytest commands to fail when installing dependencies with 
+# Poetry >= 1.3. It is however not very clear how this import fixes the issue, as the bug was 
+# difficult to understand and reproduce, so the line might become obsolete in the future.
 .PHONY: setup_env # Set up the environment
 setup_env:
 	@# The keyring install is to allow pip to fetch credentials for our internal repo if needed
@@ -40,24 +44,32 @@ setup_env:
 	if [[ $$(uname) != "Darwin" ]]; then \
 		poetry run python -m pip install -U --force-reinstall setuptools; \
 	fi
+
+	echo "Installing poetry lock ..."
 	if [[ $$(uname) != "Linux" ]] && [[ $$(uname) != "Darwin" ]]; then \
 		poetry install --only dev; \
 	else \
 		poetry install; \
 	fi
+	echo "Finished installing poetry lock."
 
-	echo "Installing $(CP_VERSION_SPEC_FOR_RC)" && \
-	poetry run python -m pip install -U --pre "$(CP_VERSION_SPEC_FOR_RC)" --no-deps
+	echo "Installing $(CONCRETE_PYTHON_VERSION)" && \
+	poetry run python -m pip install -U --pre --extra-index-url https://pypi.zama.ai/cpu "$(CONCRETE_PYTHON_VERSION)"
 	"$(MAKE)" fix_omp_issues_for_intel_mac
+	poetry run python -c "import skorch" || true # Details above
 
 .PHONY: sync_env # Synchronise the environment
-sync_env: check_poetry_version
-	if [[ $$(uname) != "Linux" ]] && [[ $$(uname) != "Darwin" ]]; then \
-		poetry install --remove-untracked --only dev; \
+sync_env: 
+	if [[ $$(poetry --version) != "Poetry (version $(POETRY_VERSION))" ]];then \
+		echo "Current Poetry version is different than $(POETRY_VERSION). Please update it.";\
 	else \
-		poetry install --remove-untracked; \
+		if [[ $$(uname) != "Linux" ]] && [[ $$(uname) != "Darwin" ]]; then \
+			poetry install --remove-untracked --only dev; \
+		else \
+			poetry install --remove-untracked; \
+		fi; \
+		"$(MAKE)" setup_env; \
 	fi
-	"$(MAKE)" setup_env
 
 .PHONY: fix_omp_issues_for_intel_mac # Fix OMP issues for macOS Intel, https://github.com/zama-ai/concrete-ml-internal/issues/3951
 fix_omp_issues_for_intel_mac:
@@ -85,15 +97,6 @@ reinstall_env:
 		"$(MAKE)" setup_env; \
 		echo "Source venv with:"; \
 		echo "source $${SOURCE_VENV_PATH}"; \
-	fi
-
-.PHONY: check_poetry_version # Check poetry's version
-check_poetry_version:
-	if [[ $$(poetry --version) == "Poetry (version $(POETRY_VERSION))" ]];then \
-		echo "Poetry version is ok";\
-	else\
-		echo "Expected poetry version is not the expected one: $(POETRY_VERSION)"\
-		exit 1;\
 	fi
 
 .PHONY: python_format # Apply python formatting
@@ -188,8 +191,8 @@ spcc:
 
 PCC_DEPS := check_python_format check_finalize_nb python_linting mypy_ci pydocstyle shell_lint
 PCC_DEPS += check_version_coherence check_licenses check_nbqa check_supported_ops
-PCC_DEPS += check_refresh_notebooks_list check_mdformat
-PCC_DEPS += check_unused_images check_utils_use_case gitleaks
+PCC_DEPS += check_refresh_notebooks_list check_refresh_use_cases_list check_mdformat
+PCC_DEPS += check_unused_images check_utils_use_case gitleaks check_symlinks
 
 .PHONY: pcc_internal
 pcc_internal: $(PCC_DEPS)
@@ -207,9 +210,9 @@ spcc_internal: $(SPCC_DEPS)
 # -svv disables capturing of stdout/stderr and enables verbose output
 # --count N is to repeate all tests N times (with different seeds). Default is to COUNT=1.
 # --randomly-dont-reorganize is to prevent Pytest from shuffling the tests' order
-# --randomly-dont-reset-seed is to make sure that, if we run the same test several times (with
-# @pytest.mark.repeat(3)), different seeds are used, even if things are still deterministic using 
-# the main seed
+# --randomly-dont-reset-seed is important: if it was not there, the randomly package would reset
+# seeds to the same value, for all tests, resulting in same random's being taken in the tests, which
+# reduces a bit the impact / coverage of our tests
 # --capture=tee-sys is to make sure that, in case of crash, we can search for "Forcing seed to" in 
 # stdout in order to be able to reproduce the failed test using that seed
 # --cache-clear is to clear all Pytest's cache at before running the tests. This is done in order to 
@@ -237,8 +240,7 @@ pytest_internal_parallel:
 # --global-coverage-infos-json=global-coverage-infos.json is to dump the coverage report in the file 
 # --cov PATH is the directory PATH to consider for coverage. Default to SRC_DIR=src
 # --cov-fail-under=100 is to make the command fail if coverage does not reach a 100%
-# --cov-report=term-missing:skip-covered is used to print the missing lines for coverage withtout 
-# taking into account skiped tests
+# --cov-report=term-missing:skip-covered is used to avoid printing covered lines for all files
 .PHONY: pytest # Run pytest on all tests
 pytest:
 	"$(MAKE)" pytest_internal_parallel \
@@ -250,7 +252,7 @@ pytest:
 	${PYTEST_OPTIONS}"
 
 # Coverage options are not included since they look to fail on macOS
-# (see https://github.com/zama-ai/concrete-ml-internal/issues/1554)
+# (see https://github.com/zama-ai/concrete-ml-internal/issues/4428)
 .PHONY: pytest_macOS_for_GitHub # Run pytest without coverage options
 pytest_macOS_for_GitHub: pytest_internal_parallel
 
@@ -272,12 +274,25 @@ pytest_no_flaky: check_current_flaky_tests
 
 # Runnning latest failed tests works by accessing pytest's cache. It is therefore recommended to
 # call '--cache-clear' when calling the previous pytest run. 
+# --cov PATH is the directory PATH to consider for coverage. Default to SRC_DIR=src
+# --cov-append is to make the coverage of the previous pytest run to also consider the tests that are
+# going to be re-executed by 'pytest_run_last_failed'
+# --cov-fail-under=100 is to make the command fail if coverage does not reach a 100%
+# --cov-report=term-missing:skip-covered is used to avoid printing covered lines for all files
+# --global-coverage-infos-json=global-coverage-infos.json is to dump the coverage report in the file 
 # --last-failed runs all last failed tests
 # --last-failed-no-failures none' indicates pytest not to run anything (instead of running 
 # all tests over again) if no failed tests are found
 .PHONY: pytest_run_last_failed # Run all failed tests from the previous pytest run
 pytest_run_last_failed:
-	poetry run pytest $(TEST) --last-failed --last-failed-no-failures none
+	poetry run pytest $(TEST) \
+	--cov=$(SRC_DIR) \
+	--cov-append \
+	--cov-fail-under=100 \
+	--cov-report=term-missing:skip-covered \
+	--global-coverage-infos-json=global-coverage-infos.json \
+	--last-failed \
+	--last-failed-no-failures none
 
 .PHONY: pytest_one # Run pytest on a single file or directory (TEST)
 pytest_one:
@@ -386,40 +401,13 @@ docker_clean_volumes:
 .PHONY: docker_cv # Docker clean volumes
 docker_cv: docker_clean_volumes
 
-.PHONY: docs # Build docs
-docs: clean_docs check_docs_dollars
-	@# Rebuild the index from README.md, to have in the home of Sphinx a copy of README.md
-	echo "  .. Warning, auto-generated by \`make docs\`, don\'t edit" > docs/index.rst
-	echo "" >> docs/index.rst
-	pandoc --from markdown --to rst docs/README.md >> docs/index.rst
-	@# To be sure there is a blank line at the end
-	echo "" >> docs/index.rst
-	cat docs/index.toc.txt >> docs/index.rst
-	@# Create _static if nothing is commited in it
-	mkdir -p docs/_static/
-	@# Generate the auto summary of documentations
-	@# Cannot do without specifying top module currently with sphinx-apidoc
-	poetry run sphinx-apidoc --implicit-namespaces -o docs/_apidoc $(CONCRETE_PACKAGE_PATH)
-	@# Doing a copy of docs, where we modify files
-	rm -rf docs-copy
-	cp -r docs docs-copy
-	@# Admonitions
-	./script/make_utils/sphinx_gitbook_admonitions.sh --gitbook_to_sphinx
-	@# Check that there is no more GitBook hint
-	! grep -r "hint style" docs-copy
-	@# Replace $$, $/$ and /$$ by $
-	./script/make_utils/fix_double_dollars_issues_with_mdformat.sh docs-copy --single_dollar
-	@# Fix not-compatible paths
-	./script/make_utils/fix_gitbook_paths.sh docs-copy
-	@# Fixing cardboard
-	poetry run python script/doc_utils/fix_gitbook_table.py --files docs-copy/getting-started/showcase.md
-	@# Docs
-	cd docs-copy && poetry run "$(MAKE)" html SPHINXOPTS='-W --keep-going'
-	@# Copy images from GitBook
-	cp docs/.gitbook/assets/*.png docs-copy/_build/html/_images
-	cp -r use_case_examples docs-copy/_build/
-	cp -r docs-copy/_build docs/
-	rm -rf docs-copy
+.PHONY: docs_no_links # Build docs
+docs_no_links: check_docs_dollars
+	@# Fix not-compatible paths that are sometimes generated by GitBook edits
+	./script/make_utils/fix_gitbook_paths.sh docs
+
+.PHONY: docs # Build docs and check links
+docs: docs_no_links
 	@# Check links
 	"$(MAKE)" check_links
 
@@ -432,9 +420,6 @@ remove_5c_docs:
 apidocs:
 	@# At release time, one needs to change --src-base-url (to be a public release/A.B.x branch)
 	./script/doc_utils/update_apidocs.sh "$(APIDOCS_OUTPUT)"
-
-	# Update our summary
-	./script/doc_utils/update_apidocs_files_in_SUMMARY.sh
 	"$(MAKE)" mdformat
 
 .PHONY: check_apidocs # Check that API docs are ok and
@@ -442,9 +427,6 @@ check_apidocs:
 	@# Check nothing has changed
 	./script/doc_utils/check_apidocs.sh
 
-.PHONY: clean_docs # Clean docs build directory
-clean_docs:
-	rm -rf docs/_apidoc docs/_build
 
 .PHONY: check_docs_dollars # Check that latex equations are enclosed by double dollar signs
 check_docs_dollars:
@@ -453,13 +435,6 @@ check_docs_dollars:
 # Only double dollar signs $$ should be used in order to 
 # show properly in gitbook
 	./script/make_utils/check_double_dollars_in_doc.sh
-
-.PHONY: open_docs # Launch docs in a browser
-open_docs:
-	python3 -m webbrowser -t "file://${PWD}/docs/_build/html/index.html"
-
-.PHONY: docs_and_open # Make docs and open them in a browser
-docs_and_open: docs open_docs
 
 .PHONY: pydocstyle # Launch syntax checker on source code documentation
 pydocstyle:
@@ -475,9 +450,11 @@ finalize_nb:
 # A warning in a package unrelated to the project made pytest fail with notebooks
 # Run notebook tests without warnings as sources are already tested with warnings treated as errors
 # We need to disable xdist with -n0 to make sure to not have IPython port race conditions
+# The deployment notebook is currently skipped until the AMI is fixed
+# FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/4064
 .PHONY: pytest_nb # Launch notebook tests
 pytest_nb:
-	NOTEBOOKS=$$(find docs -name "*.ipynb" | grep -v _build | grep -v .ipynb_checkpoints || true) && \
+	NOTEBOOKS=$$(find docs -name "*.ipynb" ! -name "*Deployment*" | grep -v _build | grep -v .ipynb_checkpoints || true) && \
 	if [[ "$${NOTEBOOKS}" != "" ]]; then \
 		echo "$${NOTEBOOKS}" | xargs poetry run pytest -svv \
 		--capture=tee-sys \
@@ -512,9 +489,17 @@ jupyter_execute_parallel:
 refresh_notebooks_list:
 	poetry run python script/actions_utils/refresh_notebooks_list.py .github/workflows/refresh-one-notebook.yaml
 
+.PHONY: refresh_use_cases_list # Refresh the list of use cases currently available 
+refresh_use_cases_list:
+	poetry run python script/actions_utils/refresh_use_cases_list.py .github/workflows/run_one_use_cases_example.yaml
+
 .PHONY: check_refresh_notebooks_list # Check if the list of notebooks currently available hasn't change
 check_refresh_notebooks_list:
 	poetry run python script/actions_utils/refresh_notebooks_list.py .github/workflows/refresh-one-notebook.yaml --check
+
+.PHONY: check_refresh_use_cases_list # Check if the list of use cases currently available hasn't change
+check_refresh_use_cases_list:
+	poetry run python script/actions_utils/refresh_use_cases_list.py .github/workflows/run_one_use_cases_example.yaml --check
 
 .PHONY: release_docker # Build a docker release image
 release_docker:
@@ -533,11 +518,11 @@ pytest_codeblocks:
 
 .PHONY: pytest_codeblocks_pypi_wheel_cml # Test code blocks using the PyPI local wheel of Concrete ML
 pytest_codeblocks_pypi_wheel_cml:
-	./script/make_utils/pytest_pypi_cml.sh --wheel "$(CP_VERSION_SPEC_FOR_RC)" --codeblocks
+	./script/make_utils/pytest_pypi_cml.sh --wheel --codeblocks
 
-.PHONY: pytest_codeblocks_pip_cml # Test code blocks using PyPI Concrete ML
-pytest_codeblocks_pip_cml:
-	./script/make_utils/pytest_pypi_cml.sh --codeblocks
+.PHONY: pytest_codeblocks_pypi_cml # Test code blocks using PyPI Concrete ML
+pytest_codeblocks_pypi_cml:
+	./script/make_utils/pytest_pypi_cml.sh --codeblocks --version "$${VERSION}"
 
 .PHONY: pytest_codeblocks_one # Test code blocks using pytest in one file (TEST)
 pytest_codeblocks_one:
@@ -570,30 +555,27 @@ check_version_coherence:
 
 .PHONY: changelog # Generate a changelog
 changelog: check_version_coherence
-	PROJECT_VER="$${poetry version --short}" && \
+	PROJECT_VER="${poetry version --short}" && \
 	poetry run python ./script/make_utils/changelog_helper.py > "CHANGELOG_$${PROJECT_VER}.md"
 
-.PHONY: show_scope # Show the accepted types and optional scopes (for git conventional commits)
-show_scope:
-	@echo "Accepted types and optional scopes:"
+.PHONY: show_commit_rules # Show the accepted rules for git conventional commits
+show_commit_rules:
+	@echo "Accepted commit rules:"
 	@cat .github/workflows/continuous-integration.yaml | grep feat | grep pattern | cut -f 2- -d ":" | cut -f 2- -d " "
-
-.PHONY: show_type # Show the accepted types and optional scopes (for git conventional commits)
-show_type:show_scope
 
 .PHONY: licenses # Generate the list of licenses of dependencies
 licenses:
-	./script/make_utils/licenses.sh --cp_version "$(CP_VERSION_SPEC_FOR_RC)"
+	./script/make_utils/licenses.sh --cp_version "$(CONCRETE_PYTHON_VERSION)"
 
 .PHONY: force_licenses # Generate the list of licenses of dependencies (force the regeneration)
 force_licenses:
-	./script/make_utils/licenses.sh --cp_version "$(CP_VERSION_SPEC_FOR_RC)" --force_update
+	./script/make_utils/licenses.sh --cp_version "$(CONCRETE_PYTHON_VERSION)" --force_update
 
 .PHONY: check_licenses # Check if the licenses of dependencies have changed
 check_licenses:
 	@TMP_OUT="$$(mktemp)" && \
 	if ! poetry run env bash ./script/make_utils/licenses.sh --check \
-		--cp_version "$(CP_VERSION_SPEC_FOR_RC)" > "$${TMP_OUT}"; then \
+		--cp_version "$(CONCRETE_PYTHON_VERSION)" > "$${TMP_OUT}"; then \
 		cat "$${TMP_OUT}"; \
 		rm -f "$${TMP_OUT}"; \
 		echo "Error while checking licenses, see log above."; \
@@ -651,7 +633,7 @@ mdformat:
 # Remark we need to remove .md's in venv
 check_mdformat:
 	"$(MAKE)" mdformat
-	find docs -name "*.md" | grep -v docs/developer-guide/tmp.api_for_check | xargs git diff --quiet
+	find docs -name "*.md" | grep -v docs/references/tmp.api_for_check | xargs git diff --quiet
 
 .PHONY: benchmark # Perform benchmarks
 benchmark:
@@ -706,9 +688,11 @@ check_supported_ops:
 	git diff docs/deep-learning/onnx_support.md
 	git diff --quiet docs/deep-learning/onnx_support.md
 
+# The log-opts option checks the whole history between the first commit and the current commit
+# The default of gitleaks it to check the whole history.
 .PHONY: gitleaks # Check for secrets in the repo using gitleaks
 gitleaks:
-	gitleaks --source "$${PWD}" detect --redact -v
+	gitleaks --source "$${PWD}" detect --redact -v --log-opts="$$(git rev-list HEAD | tail -n 1)..$$(git rev-parse HEAD)"
 
 .PHONY: sanity_check # Sanity checks, e.g. to check that a release is viable
 sanity_check:
@@ -730,7 +714,7 @@ check_links:
 	@# To avoid some issues with priviledges and linkcheckmd
 	find docs/ -name "*.md" -type f | xargs chmod +r
 
-	@# Run linkcheck on mardown files. It is mainly used for web links and _api_doc (Sphinx)
+	@# Run linkcheck on mardown files. It is mainly used for web links
 	poetry run python -m linkcheckmd docs -local
 	poetry run python -m linkcheckmd README.md
 
@@ -744,20 +728,16 @@ check_links:
 	@# 	--ignore-url=_static/webpack-macros.html: useless file which contains wrong links
 	@#  --ignore-url=https://www.conventionalcommits.org/en/v1.0.0/: because issues to connect to
 	@#		the server from AWS
-	@#  --ignore-url=https://www.openml.org: lot of time outs
+	@#  --ignore-url=https://www.openml.org: this website returns a lots of timeouts
 	@#  --ignore-url=https://github.com/zama-ai/concrete-ml-internal/issues: because issues are
 	@#		private
-	@#	--ignore-url=.gitbook/assets : some gitbook functionalities use links to images to include
-	@# 		them in the docs. But sphinx does not copy such as images to the _build dir since 
-	@#		they are not included by image tags or sphinx image annotations. We ignore links 
-	@#		to gitbook images in the HTML checker. But the images are actually checked by the 
-	@#		markdown link checker, `local_link_check.sh`.
+	@#  --ignore-url=https://arxiv.org: this website returns a lots of timeouts
 	poetry run linkchecker docs --check-extern \
-		--ignore-url=_static/webpack-macros.html \
+		--no-warnings \
 		--ignore-url=https://www.conventionalcommits.org/en/v1.0.0/ \
 		--ignore-url=https://www.openml.org \
 		--ignore-url=https://github.com/zama-ai/concrete-ml-internal/issues \
-		--ignore-url=.gitbook/assets
+		--ignore-url=https://arxiv.org
 
 .PHONY: actionlint # Linter for our github actions
 actionlint:
@@ -781,15 +761,19 @@ check_unused_images:
 
 .PHONY: pytest_pypi_wheel_cml # Run tests using PyPI local wheel of Concrete ML
 pytest_pypi_wheel_cml:
-	./script/make_utils/pytest_pypi_cml.sh --wheel "$(CP_VERSION_SPEC_FOR_RC)"
+	./script/make_utils/pytest_pypi_cml.sh --wheel
 
 .PHONY: pytest_pypi_wheel_cml_no_flaky # Run tests (except flaky ones) using PyPI local wheel of Concrete ML
 pytest_pypi_wheel_cml_no_flaky:
-	./script/make_utils/pytest_pypi_cml.sh --wheel "$(CP_VERSION_SPEC_FOR_RC)" --noflaky
+	./script/make_utils/pytest_pypi_cml.sh --wheel --noflaky
 
-.PHONY: pytest_pip_cml # Run tests using PyPI Concrete ML
-pytest_pip_cml:
+.PHONY: pytest_pypi_cml # Run tests using PyPI Concrete ML
+pytest_pypi_cml:
 	./script/make_utils/pytest_pypi_cml.sh
+
+.PHONY: pytest_pypi_cml_no_flaky # Run tests (except flaky ones) using PyPI Concrete ML
+pytest_pypi_cml_no_flaky:
+	./script/make_utils/pytest_pypi_cml.sh --noflaky --version "$${VERSION}"
 
 .PHONY: clean_pycache # Clean __pycache__ directories
 clean_pycache:
@@ -799,9 +783,9 @@ clean_pycache:
 clean_sklearn_cache:
 	rm -rf ~/scikit_learn_data
 
-.PHONY: run_one_use_case_example # Run one use-case example (USE_CASE, eg use_case_examples/hybrid_model)
+.PHONY: run_one_use_case_example # Run one use-case example (USE_CASE, e.g. hybrid_model)
 run_one_use_case_example:
-	./script/make_utils/run_use_case_examples.sh
+	USE_CASE=$(USE_CASE) ./script/make_utils/run_use_case_examples.sh
 
 .PHONY: run_all_use_case_examples # Run all use-case examples
 run_all_use_case_examples:
@@ -810,3 +794,16 @@ run_all_use_case_examples:
 .PHONY: check_utils_use_case # Check that no utils.py are found in use_case_examples
 check_utils_use_case:
 	./script/make_utils/check_utils_in_use_case.sh
+
+.PHONY: update_encrypted_dataframe # Update encrypted data-frame's development files
+update_encrypted_dataframe:
+	poetry run python ./script/make_utils/update_encrypted_dataframe_files.py
+
+.PHONY: check_symlinks # Check that no utils.py are found in use_case_examples
+check_symlinks:
+	if [[ -z $$(find . -xtype l -name abc) ]]; then \
+		echo "All symlinks point to exiting files"; \
+	else \
+		echo "Bad symlinks found: " && echo $$(find . -xtype l) && \
+		exit 1; \
+	fi

@@ -3,8 +3,8 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.ref }}
-  cancel-in-progress: true
+  group: "${{ github.ref }}-${{ github.event_name }}-${{ github.workflow }}"
+  cancel-in-progress: false
 
 env:
   ACTION_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -18,10 +18,10 @@ jobs:
       ec2-instance-id-38: ${{ steps.start-ec2-runner-38.outputs.ec2-instance-id || '' }}
     steps:
       - name: Checkout Code
-        uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@8c3f20df09ac63af7b3ae3d7c91f105f857d8497
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -29,7 +29,7 @@ jobs:
 
       - name: Start EC2 runner python 38
         id: start-ec2-runner-38
-        uses: machulav/ec2-github-runner@4e0303de215db88e1c489e07a15ca4d867f488ea
+        uses: machulav/ec2-github-runner@fcfb31a5760dad1314a64a0e172b78ec6fc8a17e
         with:
           mode: start
           github-token: ${{ secrets.EC2_RUNNER_BOT_TOKEN }}
@@ -71,12 +71,12 @@ jobs:
           apt update && apt install git git-lfs -y
 
       - name: Checkout Code
-        uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
         with:
           lfs: true
 
       - name: 'Set up Python 3.8'
-        uses: actions/setup-python@61a6322f88396a6271a6ee3565807d608ecaddd1
+        uses: actions/setup-python@82c7e631bb3cdc910f68e0081d67478d79c6982d
         with:
           python-version: '3.8'
 
@@ -89,18 +89,26 @@ jobs:
         run: |
           make jupyter_execute
 
+      - name: Prepare PR Body
+        run: |
+          SUCCESSFUL_NOTEBOOKS=$(cat ./successful_notebooks.txt | tr '\n' ' ' | sed 's/ /\\n- /g')
+          FAILED_NOTEBOOKS=$(cat ./failed_notebooks.txt | tr '\n' ' ' | sed 's/ /\\n- /g')
+          PR_BODY="Automatic PR with notebook refresh for ${{ github.ref_name }}.\\n"
+          PR_BODY+="## Successful Notebooks\\n- $SUCCESSFUL_NOTEBOOKS\\n"
+          PR_BODY+="## Failed Notebooks\\n- $FAILED_NOTEBOOKS"
+          echo "PR_BODY=${PR_BODY}" >> "$GITHUB_ENV"
+
       - name: Open PR
-        uses: peter-evans/create-pull-request@284f54f989303d2699d373481a0cfa13ad5a6666
+        uses: peter-evans/create-pull-request@c5a7806660adbe173f04e3e038b0ccdcd758773c
         with:
           token: ${{ secrets.BOT_TOKEN }}
           commit-message: "chore: refresh notebooks"
           branch: "refresh-notebooks-for-${{ github.ref_name }}"
           base: "${{ github.ref_name }}"
           title: "Refresh notebooks for ${{ github.ref_name }}"
-          body: "Automatic PR with notebooks refresh for ${{ github.ref_name }}."
+          body: ${{ env.PR_BODY }}
           add-paths: |
             docs/**/*.ipynb
-
 
   stop-runner-linux:
     name: Stop EC2 runner
@@ -109,14 +117,14 @@ jobs:
     if: ${{ always() && (needs.start-runner-linux.result != 'skipped') }}
     steps:
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@8c3f20df09ac63af7b3ae3d7c91f105f857d8497
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
       - name: Stop EC2 runner python 38
-        uses: machulav/ec2-github-runner@4e0303de215db88e1c489e07a15ca4d867f488ea
+        uses: machulav/ec2-github-runner@fcfb31a5760dad1314a64a0e172b78ec6fc8a17e
         if: ${{ always() && needs.start-runner-linux.outputs.ec2-instance-id-38 }}
         with:
           github-token: ${{ secrets.EC2_RUNNER_BOT_TOKEN }}
@@ -136,7 +144,7 @@ jobs:
     name: Send Slack notification
     runs-on: ubuntu-20.04
     steps:
-      - uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608
+      - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
 
       - name: Prepare whole job status
         if: ${{ always() }}
@@ -152,7 +160,7 @@ jobs:
       - name: Slack Notification
         if: ${{ always() }}
         continue-on-error: true
-        uses: rtCamp/action-slack-notify@b24d75fe0e728a4bf9fc42ee217caa686d141ee8
+        uses: rtCamp/action-slack-notify@4e5fb42d249be6a45a298f3c9543b111b02f7907
         env:
           SLACK_CHANNEL: ${{ secrets.SLACK_CHANNEL }}
           SLACK_ICON: https://pbs.twimg.com/profile_images/1274014582265298945/OjBKP9kn_400x400.png

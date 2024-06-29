@@ -88,7 +88,7 @@ While Keras was used in this example, it is not officially supported. Additional
 
 ## Quantization Aware Training
 
-Models trained using [Quantization Aware Training](https://docs.zama.ai/concrete-ml/advanced-topics/quantization) contain quantizers in the ONNX graph. These quantizers ensure that the inputs to the Linear/Dense and Conv layers are quantized. Since these QAT models have quantizers that are configured during training to a specific number of bits, the ONNX graph will need to be imported using the same settings:
+Models trained using [Quantization Aware Training](../explanations/quantization.md) contain quantizers in the ONNX graph. These quantizers ensure that the inputs to the Linear/Dense and Conv layers are quantized. Since these QAT models have quantizers that are configured during training to a specific number of bits, the ONNX graph will need to be imported using the same settings:
 
 <!--pytest-codeblocks:skip-->
 
@@ -136,6 +136,7 @@ The following operators are supported for evaluation and conversion to an equiva
 - Equal
 - Erf
 - Exp
+- Expand
 - Flatten
 - Floor
 - Gather
@@ -178,6 +179,7 @@ The following operators are supported for evaluation and conversion to an equiva
 - Tanh
 - ThresholdedRelu
 - Transpose
+- Unfold
 - Unsqueeze
 - Where
 - onnx.brevitas.Quant

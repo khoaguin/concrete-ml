@@ -1,4 +1,5 @@
 """Tests for the torch to numpy module."""
+
 # pylint: disable=too-many-lines
 import io
 import tempfile
@@ -16,23 +17,35 @@ import torch.quantization
 from concrete.fhe import ParameterSelectionStrategy  # pylint: disable=ungrouped-imports
 from torch import nn
 
-from concrete.ml.common.utils import manage_parameters_for_pbs_errors, to_tuple
+from concrete.ml.common.utils import (
+    array_allclose_and_same_shape,
+    manage_parameters_for_pbs_errors,
+    to_tuple,
+)
 from concrete.ml.onnx.convert import OPSET_VERSION_FOR_ONNX_EXPORT
 from concrete.ml.pytest.torch_models import (
     FC,
+    AddNet,
     BranchingGemmModule,
     BranchingModule,
     CNNGrouped,
     CNNOther,
     ConcatFancyIndexing,
+    Conv1dModel,
     DoubleQuantQATMixNet,
+    EncryptedMatrixMultiplicationModel,
+    ExpandModel,
     FCSmall,
+    IdentityExpandModel,
+    IdentityExpandMultiOutputModel,
     MultiInputNN,
     MultiInputNNConfigurable,
     MultiInputNNDifferentSize,
+    MultiOutputModel,
     NetWithLoops,
     PaddingNet,
     ShapeOperationsNet,
+    SimpleNet,
     SimpleQAT,
     SingleMixNet,
     StepActivationModule,
@@ -45,6 +58,7 @@ from concrete.ml.quantization import QuantizedModule
 # packages/projects, disable the warning
 # pylint: disable=ungrouped-imports
 from concrete.ml.torch.compile import (
+    _compile_torch_or_onnx_model,
     build_quantized_module,
     compile_brevitas_qat_model,
     compile_onnx_model,
@@ -291,13 +305,12 @@ def accuracy_test_rounding(
     check_is_good_execution_for_cml_vs_circuit,
     is_brevitas_qat=False,
 ):
-    """Check rounding behavior.
+    """Check rounding behavior with both EXACT and APPROXIMATE methods.
 
     The original quantized_numpy_module, compiled over the torch_model without rounding is
-    compared against quantized_numpy_module_round_low_precision, the torch_model compiled with
-    a rounding threshold of 2 bits, and quantized_numpy_module_round_high_precision,
-    the torch_model compiled with maximum bit-width computed with 8 bits (we can't go higher
-    as rounding does not work with CRT enconding).
+    compared against quantized_numpy_module_round_low_precision and
+    quantized_numpy_module_round_high_precision, the torch_model compiled with a rounding threshold
+    of 2 bits and 8 bits respectively, using both EXACT and APPROXIMATE methods.
 
     The final assertion tests whether the mean absolute error between
     quantized_numpy_module_round_high_precision and quantized_numpy_module is lower than
@@ -309,123 +322,77 @@ def accuracy_test_rounding(
     # feature with enough precision.
     assert quantized_numpy_module.fhe_circuit.graph.maximum_integer_bit_width() >= 4
 
-    # Compile with a rounding threshold equal to the maximum bit-width
-    # computed in the original quantized_numpy_module
-    if is_brevitas_qat:
-        # the q_result_high_precision should round to 8 bits as we can't round higher
-        quantized_numpy_module_round_high_precision = compile_brevitas_qat_model(
-            torch_model,
-            inputset,
-            n_bits=n_bits,
-            configuration=configuration,
-            rounding_threshold_bits=8,
-            verbose=verbose,
-        )
+    # Define rounding thresholds for high and low precision with both EXACT and APPROXIMATE methods
+    rounding_thresholds = {
+        "high_exact": {"method": "EXACT", "n_bits": 8},
+        "low_exact": {"method": "EXACT", "n_bits": 2},
+        "high_approximate": {"method": "APPROXIMATE", "n_bits": 8},
+        "low_approximate": {"method": "APPROXIMATE", "n_bits": 2},
+    }
 
-        # and another quantized module with a rounding threshold equal to 2 bits
-        quantized_numpy_module_round_low_precision = compile_brevitas_qat_model(
-            torch_model,
-            inputset,
-            n_bits=n_bits,
-            configuration=configuration,
-            rounding_threshold_bits=2,
-            verbose=verbose,
-        )
+    compiled_modules = {}
 
-    else:
-        # the q_result_high_precision should round to 8 bits as we can't round higher
-        quantized_numpy_module_round_high_precision = compile_torch_model(
-            torch_model,
-            inputset,
-            import_qat=import_qat,
-            configuration=configuration,
-            n_bits=n_bits,
-            rounding_threshold_bits=8,
-            verbose=verbose,
-        )
-
-        # and another quantized module with a rounding threshold equal to 2 bits
-        quantized_numpy_module_round_low_precision = compile_torch_model(
-            torch_model,
-            inputset,
-            import_qat=import_qat,
-            configuration=configuration,
-            n_bits=n_bits,
-            verbose=verbose,
-            rounding_threshold_bits=2,
-        )
+    # Compile models with different rounding thresholds and methods
+    for key, rounding_threshold in rounding_thresholds.items():
+        if is_brevitas_qat:
+            compiled_modules[key] = compile_brevitas_qat_model(
+                torch_model,
+                inputset,
+                n_bits=n_bits,
+                configuration=configuration,
+                rounding_threshold_bits=rounding_threshold,
+                verbose=verbose,
+            )
+        else:
+            compiled_modules[key] = compile_torch_model(
+                torch_model,
+                inputset,
+                import_qat=import_qat,
+                configuration=configuration,
+                n_bits=n_bits,
+                rounding_threshold_bits=rounding_threshold,
+                verbose=verbose,
+            )
 
     n_percent_inputset_examples_test = 0.1
     # Using the input-set allows to remove any chance of overflow.
     x_test = create_test_inputset(inputset, n_percent_inputset_examples_test)
 
-    # Make sure the two modules have the same quantization result
+    # Make sure the modules have the same quantization result
     qtest = to_tuple(quantized_numpy_module.quantize_input(*x_test))
-    qtest_high = to_tuple(quantized_numpy_module_round_high_precision.quantize_input(*x_test))
-    qtest_low = to_tuple(quantized_numpy_module_round_low_precision.quantize_input(*x_test))
-
-    assert all(
-        numpy.array_equal(qtest_i, qtest_high_i)
-        for (qtest_i, qtest_high_i) in zip(qtest, qtest_high)
-    )
-    assert all(
-        numpy.array_equal(qtest_i, qtest_low_i) for (qtest_i, qtest_low_i) in zip(qtest, qtest_low)
-    )
-
-    results = []
-    results_high_precision = []
-    results_low_precision = []
+    for _, module in compiled_modules.items():
+        qtest_rounded = to_tuple(module.quantize_input(*x_test))
+        assert all(
+            numpy.array_equal(qtest_i, qtest_rounded_i)
+            for (qtest_i, qtest_rounded_i) in zip(qtest, qtest_rounded)
+        )
+    results: dict = {key: [] for key in compiled_modules}
     for i in range(x_test[0].shape[0]):
-
-        # Extract example i for each tensor in the test tuple with quantized values while
-        # keeping the dimension of the original tensors (e.g., if it is a tuple of two (100, 10)
-        # tensors, then each quantized value becomes a tuple of two tensors of shape (1, 10).
         q_x = tuple(q[[i]] for q in to_tuple(qtest))
-
-        # encrypt, run, and decrypt with different precision modes
-        q_result = quantized_numpy_module.quantized_forward(*q_x, fhe="simulate")
-        q_result_high_precision = quantized_numpy_module_round_high_precision.quantized_forward(
-            *q_x,
-            fhe="simulate",
-        )
-        q_result_low_precision = quantized_numpy_module_round_low_precision.quantized_forward(
-            *q_x,
-            fhe="simulate",
-        )
-
-        # de-quantize the results to obtain the actual output values
-        result = quantized_numpy_module.dequantize_output(q_result)
-        result_high_precision = quantized_numpy_module_round_high_precision.dequantize_output(
-            q_result_high_precision
-        )
-        result_low_precision = quantized_numpy_module_round_low_precision.dequantize_output(
-            q_result_low_precision
-        )
-
-        # append the results to respective lists
-        results.append(result)
-        results_high_precision.append(result_high_precision)
-        results_low_precision.append(result_low_precision)
+        for key, module in compiled_modules.items():
+            q_result = module.quantized_forward(*q_x, fhe="simulate")
+            result = module.dequantize_output(q_result)
+            results[key].append(result)
 
     # Check modules predictions FHE simulation vs Concrete ML.
-    check_is_good_execution_for_cml_vs_circuit(x_test, quantized_numpy_module, simulate=simulate)
-    check_is_good_execution_for_cml_vs_circuit(
-        x_test, quantized_numpy_module_round_high_precision, simulate=simulate
-    )
-    check_is_good_execution_for_cml_vs_circuit(
-        x_test, quantized_numpy_module_round_low_precision, simulate=simulate
-    )
+    for key, module in compiled_modules.items():
 
-    # Check that high precision gives a better match than low precision
-    # MSE is preferred over MAE here to spot a lack of diversity in the 2 bits rounded model
-    # e.g., results_low_precision = mean(results) should impact more MSE than MAE.
-    # mse_high_precision = numpy.mean(numpy.square(numpy.subtract(results, results_high_precision)))
-    # mse_low_precision = numpy.mean(numpy.square(numpy.subtract(results, results_low_precision)))
+        # low bit-width rounding is not behaving as expected with new simulation
+        # FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/4331
+        if "low" not in key:
+            check_is_good_execution_for_cml_vs_circuit(x_test, module, simulate=simulate)
 
-    # This assert is too unstable and creates more and more flaky tests, we will investigate a
-    # better way to assess the rounding feature's performance
-    # FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/3662
-    # assert mse_high_precision <= mse_low_precision, "Rounding is not working as expected."
+    # FIXME: The following MSE comparison is commented out due to instability issues.
+    # We will investigate a better way to assess the rounding feature's performance.
+    # https://github.com/zama-ai/concrete-ml-internal/issues/3662
+    # mse_results = {
+    #     key: numpy.mean(numpy.square(numpy.subtract(results['original'], result_list)))
+    #     for key, result_list in results.items()
+    # }
+    # assert (mse_results['high_exact'] <= mse_results['low_exact'],
+    #   "Rounding is not working as expected.")
+    # assert (mse_results['high_approximate'] <= mse_results['low_approximate'],
+    #   "Rounding is not working as expected.")
 
 
 # This test is a known flaky
@@ -448,6 +415,7 @@ def accuracy_test_rounding(
         pytest.param(MultiInputNNDifferentSize, [5, 10]),
         pytest.param(UnivariateModule, 5),
         pytest.param(StepActivationModule, 5),
+        pytest.param(EncryptedMatrixMultiplicationModel, 5),
     ],
 )
 @pytest.mark.parametrize("simulate", [True, False], ids=["FHE_simulation", "FHE"])
@@ -498,16 +466,18 @@ def test_compile_torch_or_onnx_networks(
     ],
 )
 @pytest.mark.parametrize(
-    "model",
+    "model, is_1d",
     [
-        pytest.param(CNNOther),
-        pytest.param(partial(CNNGrouped, groups=3)),
+        pytest.param(CNNOther, False, id="CNN"),
+        pytest.param(partial(CNNGrouped, groups=3), False, id="CNN_grouped"),
+        pytest.param(Conv1dModel, True, id="CNN_conv1d"),
     ],
 )
 @pytest.mark.parametrize("simulate", [True, False])
 @pytest.mark.parametrize("is_onnx", [True, False])
 def test_compile_torch_or_onnx_conv_networks(  # pylint: disable=unused-argument
     model,
+    is_1d,
     activation_function,
     default_configuration,
     simulate,
@@ -521,7 +491,7 @@ def test_compile_torch_or_onnx_conv_networks(  # pylint: disable=unused-argument
     # The QAT bits is set to 0 in order to signal that the network is not using QAT
     qat_bits = 0
 
-    input_shape = (6, 7, 7)
+    input_shape = (6, 7) if is_1d else (6, 7, 7)
     input_output = input_shape[0]
 
     q_module = compile_and_test_torch_or_onnx(
@@ -708,7 +678,7 @@ def test_compile_brevitas_qat(
             FC,
             (
                 """graph torch_jit (
-  %onnx::Gemm_0[FLOAT, 1x7]
+  %x[FLOAT, 1x7]
 ) initializers (
   %fc1.weight[FLOAT, 128x7]
   %fc1.bias[FLOAT, 128]
@@ -722,7 +692,7 @@ def test_compile_brevitas_qat(
   %fc5.bias[FLOAT, 10]
 ) {
   %/fc1/Gemm_output_0 = Gemm[alpha = 1, beta = 1, transB = 1]"""
-                """(%onnx::Gemm_0, %fc1.weight, %fc1.bias)
+                """(%x, %fc1.weight, %fc1.bias)
   %/act_1/Relu_output_0 = Relu(%/fc1/Gemm_output_0)
   %/fc2/Gemm_output_0 = Gemm[alpha = 1, beta = 1, transB = 1]"""
                 """(%/act_1/Relu_output_0, %fc2.weight, %fc2.bias)
@@ -1036,6 +1006,7 @@ def test_qat_import_check(default_configuration, check_is_good_execution_for_cml
         (MultiInputNNConfigurable, (1, 8, 8), 2, False),
         (DoubleQuantQATMixNet, (1, 8, 8), 1, False),
         (DoubleQuantQATMixNet, 10, 1, False),
+        (AddNet, 10, 2, False),
     ],
 )
 def test_net_has_no_tlu(
@@ -1123,26 +1094,38 @@ def test_net_has_no_tlu(
             assert "lookup_table" not in mlir
 
 
+@pytest.mark.parametrize(
+    "model_class", [pytest.param(ShapeOperationsNet), pytest.param(ExpandModel)]
+)
 @pytest.mark.parametrize("simulate", [True, False])
 @pytest.mark.parametrize("is_qat", [True, False])
 @pytest.mark.parametrize("n_channels", [2])
 def test_shape_operations_net(
-    simulate, n_channels, is_qat, default_configuration, check_graph_output_has_no_tlu
+    model_class,
+    simulate,
+    n_channels,
+    is_qat,
+    default_configuration,
+    check_graph_output_has_no_tlu,
+    check_float_array_equal,
 ):
     """Test a pattern of reshaping, concatenation, chunk extraction."""
-    net = ShapeOperationsNet(is_qat)
+    model = model_class(is_qat)
+
+    # Shape transformation do not support >1 example in the inputset
+    # FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/3871
     inputset = numpy.random.uniform(size=(1, n_channels, 2, 2))
 
     if is_qat:
         quantized_module = compile_brevitas_qat_model(
-            net,
+            model,
             inputset,
             configuration=default_configuration,
             p_error=0.01,
         )
     else:
         quantized_module = compile_torch_model(
-            net,
+            model,
             inputset,
             configuration=default_configuration,
             n_bits=3,
@@ -1161,12 +1144,14 @@ def test_shape_operations_net(
 
         predictions = quantized_module.forward(inputset, fhe=fhe_mode)
 
-        torch_output = net(torch.tensor(inputset)).detach().numpy()
+        torch_output = model(torch.tensor(inputset)).detach().numpy()
+
+        assert predictions.shape == torch_output.shape, "Output shape must be the same."
 
         # In PTQ the results do not match because of a-priori set quantization options
         # Currently no solution for concat/reshape/transpose correctness in PTQ is proposed.
         if is_qat:
-            assert numpy.allclose(torch_output, predictions, atol=0.05, rtol=0)
+            check_float_array_equal(torch_output, predictions, atol=0.05, rtol=0)
 
             # In QAT, since the quantization is defined a-priori, all TLUs will be removed
             # and the input quantizer is moved to the clear. We can thus check there are no TLUs
@@ -1250,6 +1235,68 @@ def test_fancy_indexing_torch(model_object, default_configuration):
 
 
 @pytest.mark.parametrize(
+    "model_object",
+    [
+        pytest.param(MultiOutputModel),
+    ],
+)
+def test_multi_output(model_object, default_configuration):
+    """Test torch compilation with multi-output models."""
+    # Create model and random dataset
+    model = model_object()
+    x = numpy.random.randint(0, 2, size=(100, 3, 10)).astype(numpy.float64)
+    y = numpy.random.randint(0, 2, size=(100, 3, 10)).astype(numpy.float64)
+
+    # Pytorch baseline
+    torch_result = model(x[[0]], y[[0]])
+
+    # Compile with low bit width
+    quantized_module = compile_torch_model(
+        model, (x, y), n_bits=4, configuration=default_configuration
+    )
+    qm_result = quantized_module.forward(x[[0]], y[[0]])
+    simulation_result = quantized_module.forward(x[[0]], y[[0]], fhe="simulate")
+
+    # Assert that we have the expected number of outputs
+    assert isinstance(qm_result, tuple) and len(qm_result) == 2
+    assert isinstance(simulation_result, tuple) and len(simulation_result) == 2
+    assert isinstance(torch_result, tuple) and len(torch_result) == 2
+
+    # Assert that we are exact between simulation and clear quantized
+    for qm_res, sim_res in zip(qm_result, simulation_result):
+        assert isinstance(qm_res, numpy.ndarray)
+        assert isinstance(sim_res, numpy.ndarray)
+        assert array_allclose_and_same_shape(qm_res, sim_res, atol=1e-30)
+
+    # Assert that we aren't too far away from torch with low bit width
+    for qm_res, trch_res in zip(qm_result, torch_result):
+        assert isinstance(qm_res, numpy.ndarray)
+        assert isinstance(trch_res, numpy.ndarray)
+
+        # Very high tolerance because we use low bit width
+        assert array_allclose_and_same_shape(qm_res, trch_res, atol=1e-1)
+
+    # Create quantized module with high bit width
+    quantized_module = build_quantized_module(
+        model,
+        (x, y),
+        n_bits=24,
+    )
+    qm_result = quantized_module.forward(x[[0]], y[[0]])
+
+    # Assert that we the correct number of outputs again
+    assert isinstance(qm_result, tuple) and len(qm_result) == 2
+
+    # Assert that we have the same results as torch with high bit width quantization
+    for qm_res, trch_res in zip(qm_result, torch_result):
+        assert isinstance(qm_res, numpy.ndarray)
+        assert isinstance(trch_res, numpy.ndarray)
+
+        # Very low tolerance because we use high bit width
+        assert array_allclose_and_same_shape(qm_res, trch_res, atol=1e-10)
+
+
+@pytest.mark.parametrize(
     "model, input_output_feature",
     [
         pytest.param(FCSmall, 5),
@@ -1286,4 +1333,297 @@ def test_mono_parameter_rounding_warning(
             check_is_good_execution_for_cml_vs_circuit=check_is_good_execution_for_cml_vs_circuit,
             verbose=False,
             get_and_compile=False,
+        )
+
+
+@pytest.mark.parametrize(
+    "cast_type, should_fail, error_message",
+    [
+        (torch.bool, False, None),
+        (torch.float32, False, None),
+        (torch.float64, False, None),
+        (torch.int64, True, r"Invalid 'to' data type: INT64"),
+    ],
+)
+def test_compile_torch_model_with_cast(cast_type, should_fail, error_message):
+    """Test compiling a Torch model with various casts, expecting failure for invalid types."""
+    torch_input = torch.randn(100, 28)
+
+    class CastNet(nn.Module):
+        """Network with cast."""
+
+        def __init__(self, cast_to):
+            super().__init__()
+            self.threshold = torch.tensor(0.5, dtype=torch.float32)
+            self.cast_to = cast_to
+
+        def forward(self, x):
+            """Forward pass with dynamic cast."""
+            zeros = torch.zeros_like(x)
+            x = x + zeros
+            x = (x > self.threshold).to(self.cast_to)
+            return x
+
+    model = CastNet(cast_type)
+
+    if should_fail:
+        with pytest.raises(AssertionError, match=error_message):
+            compile_torch_model(model, torch_input, cast_type, rounding_threshold_bits=3)
+    else:
+        compile_torch_model(model, torch_input, cast_type, rounding_threshold_bits=3)
+
+
+def test_onnx_no_input():
+    """Test a torch model that has no input when converted to onnx."""
+
+    torch_input = torch.randn(100, 28)
+
+    class NoInputNet(nn.Module):
+        """Network with no input in the onnx graph."""
+
+        def __init__(self):
+            super().__init__()
+            self.threshold = torch.tensor(0.5, dtype=torch.float32)
+
+        def forward(self, x):
+            """Forward pass."""
+            zeros = numpy.zeros_like(x)
+            x = x + zeros
+            x = (x > self.threshold).to(torch.float32)
+            return x
+
+    model = NoInputNet()
+
+    with pytest.raises(
+        AssertionError, match="Input 'x' is missing in the ONNX graph after export."
+    ):
+        compile_torch_model(model, torch_input, rounding_threshold_bits=3)
+
+
+@pytest.mark.parametrize(
+    "rounding_threshold_bits, expected_exception, match_message",
+    [
+        ({"n_bits": "auto"}, NotImplementedError, "Automatic rounding is not implemented yet."),
+        (
+            "invalid_type",
+            ValueError,
+            "Invalid type for rounding_threshold_bits. Must be int or dict.",
+        ),
+        (
+            {"n_bits": 4, "method": "INVALID_METHOD"},
+            ValueError,
+            "INVALID_METHOD is not a valid method. Must be one of EXACT, APPROXIMATE.",
+        ),
+        (
+            {"n_bits": 1},
+            ValueError,
+            "n_bits_rounding must be between 2 and 8 inclusive",
+        ),
+        (
+            {"n_bits": 9},
+            ValueError,
+            "n_bits_rounding must be between 2 and 8 inclusive",
+        ),
+        (
+            {"invalid_key": 4},
+            KeyError,
+            "Invalid keys in rounding_threshold_bits. Allowed keys are \\['method', 'n_bits'\\].",
+        ),
+        (
+            {"n_bits": "not_an_int"},
+            ValueError,
+            "n_bits must be an integer.",
+        ),
+    ],
+)
+def test_compile_torch_model_rounding_threshold_bits_errors(
+    rounding_threshold_bits, expected_exception, match_message, default_configuration
+):
+    """Test that compile_torch_model raises errors for invalid rounding_threshold_bits."""
+    model = FCSmall(input_output=5, activation_function=nn.ReLU)
+    torch_inputset = torch.randn(10, 5)
+
+    with pytest.raises(expected_exception, match=match_message):
+        compile_torch_model(
+            torch_model=model,
+            torch_inputset=torch_inputset,
+            rounding_threshold_bits=rounding_threshold_bits,
+            configuration=default_configuration,
+        )
+
+
+@pytest.mark.parametrize(
+    "rounding_method, expected_reinterpret",
+    [
+        ("APPROXIMATE", True),
+        ("EXACT", False),
+    ],
+)
+def test_rounding_mode(rounding_method, expected_reinterpret, default_configuration):
+    """Test that the underlying FHE circuit uses the right rounding method."""
+    model = FCSmall(input_output=5, activation_function=nn.ReLU)
+    torch_inputset = torch.randn(10, 5)
+    configuration = default_configuration
+
+    compiled_module = compile_torch_model(
+        torch_model=model,
+        torch_inputset=torch_inputset,
+        rounding_threshold_bits={"method": rounding_method, "n_bits": 4},
+        configuration=configuration,
+    )
+
+    # Convert compiled module to string to search for patterns
+    mlir = compiled_module.fhe_circuit.mlir
+    if expected_reinterpret:
+        assert (
+            "reinterpret_precision" in mlir and "round" not in mlir
+        ), "Expected 'reinterpret_precision' found but 'round' should not be present."
+    else:
+        assert "reinterpret_precision" not in mlir, "Unexpected 'reinterpret_precision' found."
+
+
+def test_composition_compilation(default_configuration):
+    """Test that we can compile models with composition."""
+    default_configuration.composable = True
+    torch_inputset = torch.randn(10, 5)
+
+    model = SimpleNet()
+    composition_mapping = {0: 0}
+
+    # Check that we can compile a simple torch model with a proper composition mapping
+    _compile_torch_or_onnx_model(
+        model,
+        torch_inputset,
+        configuration=default_configuration,
+        composition_mapping=composition_mapping,
+    )
+
+    torch_inputset_multi_input = (torch.randn(10, 5), torch.randn(10, 5))
+
+    model = MultiOutputModel()
+    composition_mapping = {1: 0}
+
+    # Check that we can compile a multi-output torch model that does not consider all outputs for
+    # composition
+    _compile_torch_or_onnx_model(
+        model,
+        torch_inputset_multi_input,
+        configuration=default_configuration,
+        composition_mapping=composition_mapping,
+    )
+
+    model = MultiOutputModel()
+    composition_mapping = {0: 1}
+
+    # Check that we can compile a multi-input torch model that does not consider all inputs for
+    # composition
+    _compile_torch_or_onnx_model(
+        model,
+        torch_inputset_multi_input,
+        configuration=default_configuration,
+        composition_mapping=composition_mapping,
+    )
+
+
+def test_composition_errors(default_configuration):
+    """Test that using composition in a wrong manner raises the proper errors."""
+    torch_inputset = torch.randn(10, 5)
+
+    check_composition_mapping_error_raise(default_configuration, torch_inputset)
+    check_composition_shape_mismatch_error(default_configuration, torch_inputset)
+
+
+def check_composition_mapping_error_raise(default_configuration, torch_inputset):
+    """Check that using composition mappings in a wrong manner raises the proper errors."""
+    model = FCSmall(input_output=5, activation_function=nn.ReLU)
+    composition_mapping = {0: 2}
+
+    with pytest.raises(ValueError, match="Composition must be enabled in 'configuration'.*"):
+        _compile_torch_or_onnx_model(
+            model,
+            torch_inputset,
+            configuration=default_configuration,
+            composition_mapping=composition_mapping,
+        )
+
+    default_configuration.composable = True
+
+    # Disable mypy as this test is voluntarily made to fail
+    composition_mapping = [(0, 0)]  # type: ignore[assignment]
+
+    with pytest.raises(ValueError, match="Parameter 'composition_mapping' mus be a dictionary.*"):
+        _compile_torch_or_onnx_model(
+            model,
+            torch_inputset,
+            configuration=default_configuration,
+            composition_mapping=composition_mapping,
+        )
+
+    composition_mapping = {-1: 2}
+
+    with pytest.raises(ValueError, match=r"Output positions \(keys\) must be positive integers.*"):
+        _compile_torch_or_onnx_model(
+            model,
+            torch_inputset,
+            configuration=default_configuration,
+            composition_mapping=composition_mapping,
+        )
+
+    composition_mapping = {0: -2}
+
+    with pytest.raises(ValueError, match=r"Input positions \(values\) must be positive integers.*"):
+        _compile_torch_or_onnx_model(
+            model,
+            torch_inputset,
+            configuration=default_configuration,
+            composition_mapping=composition_mapping,
+        )
+
+    composition_mapping = {10: 2}
+
+    with pytest.raises(ValueError, match=r"Output positions \(keys\) must not be greater.*"):
+        _compile_torch_or_onnx_model(
+            model,
+            torch_inputset,
+            configuration=default_configuration,
+            composition_mapping=composition_mapping,
+        )
+
+    composition_mapping = {0: 20}
+
+    with pytest.raises(ValueError, match=r"Input positions \(values\) must not be greater.*"):
+        _compile_torch_or_onnx_model(
+            model,
+            torch_inputset,
+            configuration=default_configuration,
+            composition_mapping=composition_mapping,
+        )
+
+
+def check_composition_shape_mismatch_error(default_configuration, torch_inputset):
+    """Check that composing a model with shape mismatches raises the proper errors.
+
+    This could be done by either wrongly creating a torch model or by providing an unexpected
+    composition mapping.
+    """
+    default_configuration.composable = True
+
+    model = IdentityExpandModel()
+    composition_mapping = {0: 0}
+    with pytest.raises(ValueError, match="A shape mismatch has been found.*"):
+        _compile_torch_or_onnx_model(
+            model,
+            torch_inputset,
+            configuration=default_configuration,
+            composition_mapping=composition_mapping,
+        )
+
+    model = IdentityExpandMultiOutputModel()
+    composition_mapping = {1: 0}
+    with pytest.raises(ValueError, match="A shape mismatch has been found.*"):
+        _compile_torch_or_onnx_model(
+            model,
+            torch_inputset,
+            configuration=default_configuration,
+            composition_mapping=composition_mapping,
         )

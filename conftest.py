@@ -1,5 +1,8 @@
 """PyTest configuration file."""
+
+import hashlib
 import json
+import os
 import random
 import re
 from pathlib import Path
@@ -12,10 +15,12 @@ from concrete.fhe import Graph as CPGraph
 from concrete.fhe.compilation import Circuit, Configuration
 from concrete.fhe.mlir.utils import MAXIMUM_TLU_BIT_WIDTH
 from sklearn.datasets import make_classification, make_regression
+from sklearn.metrics import accuracy_score
 
 from concrete.ml.common.utils import (
     SUPPORTED_FLOAT_TYPES,
     all_values_are_floats,
+    array_allclose_and_same_shape,
     is_brevitas_model,
     is_classifier_or_partial_classifier,
     is_model_class_in_a_list,
@@ -27,7 +32,7 @@ from concrete.ml.sklearn import (
     GammaRegressor,
     PoissonRegressor,
     TweedieRegressor,
-    get_sklearn_neural_net_models,
+    _get_sklearn_neural_net_models,
 )
 from concrete.ml.sklearn.base import (
     BaseTreeEstimatorMixin,
@@ -46,15 +51,6 @@ def pytest_addoption(parser):
         default=None,
         type=str,
         help="To dump pytest-cov term report to a text file.",
-    )
-
-    parser.addoption(
-        "--forcing_random_seed",
-        action="store",
-        default=None,
-        type=int,
-        help="To force the seed of each and every unit test, to be able to "
-        "reproduce a particular issue.",
     )
 
     parser.addoption(
@@ -101,7 +97,7 @@ def monkeypatched_compilation_configuration_init_for_codeblocks(
     self.enable_unsafe_features = True
     self.treat_warnings_as_errors = True
     self.use_insecure_key_cache = True
-    self.insecure_key_cache_location = "ConcreteNumpyKeyCache"
+    self.insecure_key_cache_location = "ConcretePythonKeyCache"
 
 
 def pytest_sessionstart(session: pytest.Session):
@@ -144,7 +140,27 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus):  # pylint: disabl
 
 @pytest.fixture
 def default_configuration():
-    """Return the default test compilation configuration."""
+    """Return the compilation configuration for tests that can execute in FHE."""
+
+    # Parameter `enable_unsafe_features` and `use_insecure_key_cache` are needed in order to be
+    # able to cache generated keys through `insecure_key_cache_location`. As the name suggests,
+    # these parameters are unsafe and should only be used for debugging in development
+    # Simulation compilation is done lazily when calling circuit.simulate, so we do not need to
+    # set it by default
+    return Configuration(
+        dump_artifacts_on_unexpected_failures=False,
+        enable_unsafe_features=True,
+        use_insecure_key_cache=True,
+        insecure_key_cache_location="ConcretePythonKeyCache",
+        fhe_simulation=False,
+        fhe_execution=True,
+        compress_input_ciphertexts=os.environ.get("USE_INPUT_COMPRESSION", "1") == "1",
+    )
+
+
+@pytest.fixture
+def simulation_configuration():
+    """Return the compilation configuration for tests that only simulate."""
 
     # Parameter `enable_unsafe_features` and `use_insecure_key_cache` are needed in order to be
     # able to cache generated keys through `insecure_key_cache_location`. As the name suggests,
@@ -153,7 +169,10 @@ def default_configuration():
         dump_artifacts_on_unexpected_failures=False,
         enable_unsafe_features=True,
         use_insecure_key_cache=True,
-        insecure_key_cache_location="ConcreteNumpyKeyCache",
+        insecure_key_cache_location="ConcretePythonKeyCache",
+        fhe_simulation=True,
+        fhe_execution=False,
+        compress_input_ciphertexts=os.environ.get("USE_INPUT_COMPRESSION", "1") == "1",
     )
 
 
@@ -175,28 +194,68 @@ def function_to_seed_torch(seed):
 
 
 @pytest.fixture(autouse=True)
-def autoseeding_of_everything(record_property, request):
+def autoseeding_of_everything(request):
     """Seed everything we can, for determinism."""
-    main_seed = request.config.getoption("--forcing_random_seed", default=None)
 
-    if main_seed is None:
-        main_seed = random.randint(0, 2**64 - 1)
+    # Explanations on the seeding system:
+    #
+    # The used seed (called sub_seed below) for a test of a function f_i (e.g.,
+    # test_compute_bits_precision) on a configuration c_j (e.g., x0-8) of a test file t_k (e.g.,
+    # tests/common/test_utils.py) is computed as some hash(f_i, c_j, t_k, randomly-seed)
+    #
+    # It allows to reproduce bugs we would have had on a full pytest execution on a configuration
+    # (f_i, c_j, t_k) by calling pytest on this single configuration with the --randomly-seed
+    # parameter and no other arguments.
+    #
+    # In particular, it is resistant to crashes which would prevent the few prints below in this
+    # function, which details some seeding information
 
-    seed = main_seed
-    record_property("main seed", main_seed)
+    randomly_seed = request.config.getoption("--randomly-seed", default=None)
 
-    # Python
-    random.seed(seed)
-    print("\nForcing seed to random.seed to ", seed)
+    if randomly_seed is None:
+        raise ValueError("--randomly-seed has not been properly configured internally")
+
+    # Get the absolute path of the test file
+    absolute_path = str(request.fspath)
+
+    # Find the tests directory by searching for '/tests/' in the path
+    test_dir_index = absolute_path.find("/tests/")
+    if test_dir_index == -1:
+        raise ValueError(
+            "Unable to find '/tests/' directory in the path. "
+            "Make sure the test file is within a '/tests/' directory."
+        )
+
+    # Extract the relative path from the point of the '/tests/' directory
+    relative_file_path = absolute_path[test_dir_index + 1 :]
+
+    # Derive the sub_seed from the randomly_seed and the test name
+    derivation_string = f"{relative_file_path} # {str(request.node.name)} # {randomly_seed}"
+
+    hash_object = hashlib.sha256()
+    hash_object.update(derivation_string.encode("utf-8"))
+    hash_value = hash_object.hexdigest()
+
+    # The hash is a SHA256, so 256b. And random.seed wants a 64b seed and numpy.random.seed wants a
+    # 32b seed. So we reduce a bit
+    sub_seed = int(hash_value, 16) % 2**64
+
+    print(f"\nUsing {randomly_seed=}\nUsing {derivation_string=}\nUsing {sub_seed=}")
+
+    # And then, do everything per this sub_seed
+    seed = sub_seed
+
     print(
-        f"\nRelaunch the tests with --forcing_random_seed {seed} "
-        + "--randomly-dont-reset-seed to reproduce. Remark that adding --randomly-seed=... "
-        + "is needed when the testcase uses randoms in pytest parameters"
+        f"\nRelaunch the tests with --randomly-seed {randomly_seed} "
+        + "--randomly-dont-reset-seed to reproduce."
     )
     print(
         "Remark that potentially, any option used in the pytest call may have an impact so in "
         + "case of problem to reproduce, you may want to have a look to `make pytest` options"
     )
+
+    # Python
+    random.seed(seed)
 
     # Numpy
     seed += 1
@@ -205,7 +264,8 @@ def autoseeding_of_everything(record_property, request):
     # Seed torch
     seed += 1
     function_to_seed_torch(seed)
-    return {"main seed": main_seed}
+
+    return {"randomly seed": randomly_seed}
 
 
 @pytest.fixture
@@ -288,41 +348,48 @@ def check_circuit_precision():
     return check_circuit_precision_impl
 
 
-def check_array_equality_impl(actual: Any, expected: Any, verbose: bool = True):
-    """Assert that `actual` is equal to `expected`."""
-
-    assert numpy.array_equal(actual, expected), (
-        ""
-        if not verbose
-        else f"""
-
-Expected Output
-===============
-{expected}
-
-Actual Output
-=============
-{actual}
-
-        """
-    )
-
-
 @pytest.fixture
-def check_array_equality():
+def check_array_equal():
     """Fixture to check array equality."""
 
-    return check_array_equality_impl
+    def check_array_equal_impl(actual: Any, expected: Any, verbose: bool = True):
+        """Assert that `actual` is equal to `expected`."""
+
+        assert numpy.array_equal(actual, expected), (
+            ""
+            if not verbose
+            else f"""
+
+    Expected Output
+    ===============
+    {expected}
+
+    Actual Output
+    =============
+    {actual}
+
+            """
+        )
+
+    return check_array_equal_impl
 
 
 @pytest.fixture
-def check_float_arrays_equal():
+def check_float_array_equal():
     """Fixture to check if two float arrays are equal with epsilon precision tolerance."""
 
-    def check_float_arrays_equal_impl(a, b):
-        assert numpy.all(numpy.isclose(a, b, rtol=0, atol=0.001))
+    def check_float_array_equal_impl(
+        a, b, rtol=0, atol=0.001, error_information: Optional[str] = ""
+    ):
 
-    return check_float_arrays_equal_impl
+        error_message = (
+            f"Not equal to tolerance rtol={rtol}, atol={atol}\na: {a}\nb: {b}\n"
+            f"{error_information}"
+        )
+
+        assert array_allclose_and_same_shape(a, b, rtol, atol), error_message
+
+    return check_float_array_equal_impl
 
 
 @pytest.fixture
@@ -339,8 +406,7 @@ def check_r2_score():
         r2_num = numpy.sum(deltas_actual**2)
 
         # If the values are really close, we consider the test passes
-        is_close = numpy.allclose(expected, actual, atol=1e-4, rtol=0)
-        if is_close:
+        if array_allclose_and_same_shape(expected, actual, atol=1e-4, rtol=0):
             return
 
         # If the variance of the target values is very low, fix the max allowed for residuals
@@ -360,7 +426,7 @@ def check_accuracy():
     """Fixture to check the accuracy."""
 
     def check_accuracy_impl(expected, actual, threshold=0.9):
-        accuracy = numpy.mean(expected == actual)
+        accuracy = accuracy_score(expected, actual)
         assert accuracy >= threshold, f"Accuracy of {accuracy} is not high enough ({threshold})."
 
     return check_accuracy_impl
@@ -402,7 +468,7 @@ def load_data():
             )
 
             # Cast inputs to float32 as skorch QNNs don't handle float64 values
-            if is_model_class_in_a_list(model_class, get_sklearn_neural_net_models()):
+            if is_model_class_in_a_list(model_class, _get_sklearn_neural_net_models()):
                 generated_classifier[0] = generated_classifier[0].astype(numpy.float32)
 
             return tuple(generated_classifier)
@@ -420,7 +486,7 @@ def load_data():
 
             # If the model is a neural network and if the data-set only contains a single target
             # (e.g., of shape (n,)), reshape the target array (e.g., to shape (n,1))
-            if is_model_class_in_a_list(model_class, get_sklearn_neural_net_models()):
+            if is_model_class_in_a_list(model_class, _get_sklearn_neural_net_models()):
                 if len(generated_regression[1].shape) == 1:
                     generated_regression[1] = generated_regression[1].reshape(-1, 1)
 
@@ -472,8 +538,8 @@ def check_is_good_execution_for_cml_vs_circuit():
         for _ in range(n_allowed_runs):
             # Check if model is QuantizedModule
             if isinstance(model, QuantizedModule):
-                results_cnp_circuit = model.forward(*inputs, fhe=fhe_mode)
-                results_model = model.forward(*inputs, fhe="disable")
+                y_pred_fhe = model.forward(*inputs, fhe=fhe_mode)
+                y_pred_quantized = model.forward(*inputs, fhe="disable")
 
             else:
                 assert isinstance(
@@ -492,19 +558,17 @@ def check_is_good_execution_for_cml_vs_circuit():
                     # as much post-processing steps in the clear (that could lead to more flaky
                     # tests), especially since these results are tested in other tests such as the
                     # `check_subfunctions_in_fhe`
-                    if is_classifier_or_partial_classifier(model):
-                        if isinstance(model, SklearnKNeighborsMixin):
-                            # For KNN `predict_proba` is not supported for now
-                            # FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/3962
-                            results_cnp_circuit = model.predict(*inputs, fhe=fhe_mode)
-                            results_model = model.predict(*inputs, fhe="disable")
-                        else:
-                            results_cnp_circuit = model.predict_proba(*inputs, fhe=fhe_mode)
-                            results_model = model.predict_proba(*inputs, fhe="disable")
+                    # For KNN `predict_proba` is not supported for now
+                    # FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/3962
+                    if is_classifier_or_partial_classifier(model) and not isinstance(
+                        model, SklearnKNeighborsMixin
+                    ):
+                        y_pred_fhe = model.predict_proba(*inputs, fhe=fhe_mode)
+                        y_pred_quantized = model.predict_proba(*inputs, fhe="disable")
 
                     else:
-                        results_cnp_circuit = model.predict(*inputs, fhe=fhe_mode)
-                        results_model = model.predict(*inputs, fhe="disable")
+                        y_pred_fhe = model.predict(*inputs, fhe=fhe_mode)
+                        y_pred_quantized = model.predict(*inputs, fhe="disable")
 
                 else:
                     raise ValueError(
@@ -512,15 +576,12 @@ def check_is_good_execution_for_cml_vs_circuit():
                         "a QuantizedModule object."
                     )
 
-            # FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/2806
-            # fp64 comparisons do not pass the numpy.array_equal while the quantized
-            # int64 values do.
-            if numpy.isclose(results_cnp_circuit, results_model).all():
+            if array_allclose_and_same_shape(y_pred_fhe, y_pred_quantized):
                 return
 
         raise RuntimeError(
-            f"Mismatch between circuit results:\n{results_cnp_circuit}\n"
-            f"and model function results:\n{results_model}"
+            f"Mismatch between circuit results:\n{y_pred_fhe}\n"
+            f"and model function results:\n{y_pred_quantized}"
         )
 
     return check_is_good_execution_for_cml_vs_circuit_impl

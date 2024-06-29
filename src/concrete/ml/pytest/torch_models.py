@@ -15,6 +15,29 @@ from concrete.ml.quantization.qat_quantizers import Int8ActPerTensorPoT, Int8Wei
 # pylint: disable=too-many-lines
 
 
+class MultiOutputModel(nn.Module):
+    """Multi-output model."""
+
+    def __init__(
+        self,
+    ) -> None:
+        """Torch Model."""
+        super().__init__()
+        self.value = 3.0
+
+    def forward(self, x, y):
+        """Forward pass.
+
+        Args:
+            x (torch.Tensor): The input of the model.
+            y (torch.Tensor): The input of the model.
+
+        Returns:
+            Tuple[torch.Tensor. torch.Tensor]: Outputs of the network.
+        """
+        return x + y + self.value, (x - y) ** 2
+
+
 class SimpleNet(torch.nn.Module):
     """Fake torch model used to generate some onnx."""
 
@@ -171,6 +194,7 @@ class CNNOther(nn.Module):
         self.conv1 = nn.Conv2d(input_output, 3, 3, stride=1, padding=1)
         self.pool = nn.AvgPool2d(2, 2)
         self.conv2 = nn.Conv2d(3, 3, 1)
+        self.bn1 = nn.BatchNorm2d(3)
         self.fc1 = nn.Linear(3 * 3 * 3, 5)
         self.fc2 = nn.Linear(5, 3)
         self.fc3 = nn.Linear(3, 2)
@@ -187,6 +211,7 @@ class CNNOther(nn.Module):
         """
         x = self.pool(self.activation_function(self.conv1(x)))
         x = self.activation_function(self.conv2(x))
+        x = self.bn1(x)
         x = x.flatten(1)
         x = self.activation_function(self.fc1(x))
         x = self.activation_function(self.fc2(x))
@@ -842,9 +867,7 @@ class SimpleQAT(nn.Module):
         n_bits_weights = n_bits
 
         # Generate the pattern 0, 1, ..., 2^N-1, 0, 1, .. 2^N-1, 0, 1..
-        all_weights = numpy.mod(
-            numpy.arange(numpy.prod(self.fc1.weight.shape)), 2**n_bits_weights
-        )
+        all_weights = numpy.mod(numpy.arange(numpy.prod(self.fc1.weight.shape)), 2**n_bits_weights)
 
         # Shuffle the pattern and reshape to weight shape
         numpy.random.shuffle(all_weights)
@@ -1064,26 +1087,7 @@ class TorchSum(nn.Module):
             torch_sum (torch.tensor): The sum of the input's tensor elements along the given axis
         """
         torch_sum = x.sum(dim=self.dim, keepdim=self.keepdim)
-        return torch_sum
 
-
-class TorchSumMod(TorchSum):
-    """Torch model to test the ReduceSum ONNX operator in a circuit containing a PBS."""
-
-    def forward(self, x):
-        """Forward pass.
-
-        Args:
-            x (torch.tensor): The input of the model
-
-        Returns:
-            torch_sum (torch.tensor): The sum of the input's tensor elements along the given axis
-        """
-        torch_sum = x.sum(dim=self.dim, keepdim=self.keepdim)
-
-        # Add an additional operator that requires a TLU in order to force this circuit to
-        # handle a PBS without actually changing the results
-        torch_sum = torch_sum + torch_sum % 2 - torch_sum % 2
         return torch_sum
 
 
@@ -1409,3 +1413,190 @@ class PartialQATModel(torch.nn.Module):
         """
 
         return self.sub_module(x)
+
+
+class EncryptedMatrixMultiplicationModel(nn.Module):
+    """PyTorch module for performing matrix multiplication between two encrypted values."""
+
+    # pylint: disable-next=unused-argument
+    def __init__(self, input_output, activation_function):
+        super().__init__()
+        self.act = activation_function()
+
+    def forward(self, input1):
+        """Forward function for matrix multiplication.
+
+        Args:
+            input1 (torch.Tensor): The first input tensor.
+
+        Returns:
+            torch.Tensor: The result of the matrix multiplication.
+        """
+        input1 = input1.unsqueeze(1)
+
+        output = torch.matmul(input1, input1.transpose(2, 1))
+        output = self.act(output)
+
+        # Squeeze out one of the last two singleton dimensions
+        output = output.squeeze(-1)
+        return output
+
+
+class ManualLogisticRegressionTraining(torch.nn.Module):
+    """PyTorch module for performing SGD training."""
+
+    def __init__(self, learning_rate=0.1):
+        super().__init__()
+        self.learning_rate = learning_rate
+
+    def forward(self, x, y, weights, bias):
+        """Forward function for matrix multiplication.
+
+        Args:
+            x (torch.Tensor): The training data tensor.
+            y (torch.Tensor): The target tensor.
+            weights (torch.Tensor): The weights to be learned.
+            bias (torch.Tensor): The bias to be learned.
+
+        Returns:
+            torch.Tensor: The updated weights after performing a training step.
+        """
+        z = torch.bmm(x, weights) + bias
+        output = torch.sigmoid(z)
+
+        difference_z = output - y
+        dweights = torch.bmm(x.transpose(1, 2), difference_z) / x.size(1)
+
+        weights = weights - self.learning_rate * dweights
+
+        return weights
+
+    @staticmethod
+    def predict(x, weights, bias):
+        """Predicts based on weights and bias as inputs.
+
+        Args:
+            x (torch.Tensor): Input data tensor.
+            weights (torch.Tensor): Weights tensor.
+            bias (torch.Tensor): Bias tensor.
+
+        Returns:
+            torch.Tensor: The predicted outputs for the given inputs.
+        """
+        with torch.no_grad():
+            batch_size = x.shape[0]
+
+            # Expand weights and bias dimensions to match the batch size of X
+            weights_expanded = weights.expand(batch_size, -1, -1)
+            bias_expanded = bias.expand(batch_size, -1, -1)
+
+            outputs = torch.sigmoid(torch.bmm(x, weights_expanded) + bias_expanded)
+        return outputs.squeeze()
+
+
+class AddNet(nn.Module):
+    """Torch model that performs a simple addition between two inputs."""
+
+    def __init__(self, use_conv, use_qat, input_output, n_bits):  # pylint: disable=unused-argument
+        super().__init__()
+        # No initialization needed for simple addition
+
+    @staticmethod
+    def forward(x, y):
+        """Forward pass.
+
+        Args:
+            x: First input tensor.
+            y: Second input tensor.
+
+        Returns:
+            Result of adding x and y.
+        """
+        return x + y
+
+
+class ExpandModel(nn.Module):
+    """Minimalist network that expands the input tensor to a larger size."""
+
+    def __init__(self, is_qat):  # pylint: disable=unused-argument
+        super().__init__()
+        self.is_qat = is_qat
+        if is_qat:
+            self.input_quant = qnn.QuantIdentity(bit_width=8)
+
+    def forward(self, x):
+        """Expand the input tensor to the target size.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+
+        Returns:
+            torch.Tensor: Expanded tensor.
+        """
+        if self.is_qat:
+            x = self.input_quant(x)
+        x = x.reshape(x.shape + (1,))
+        return x.expand(x.shape[:-1] + (4,))
+
+
+class Conv1dModel(nn.Module):
+    """Small model that uses a 1D convolution operator."""
+
+    def __init__(self, input_output, activation_function) -> None:
+        super().__init__()
+
+        self.conv1 = nn.Conv1d(input_output, 2, 2, stride=1, padding=0)
+        self.bn1 = nn.BatchNorm1d(2)
+        self.act = activation_function()
+        self.fc1 = nn.Linear(input_output, 3)
+
+    def forward(self, x):
+        """Forward pass.
+
+        Args:
+            x (torch.Tensor): The model's input.
+
+        Returns:
+            torch.Tensor: The model's output.
+
+        """
+        x = self.act(self.conv1(x))
+        x = self.bn1(x)
+        x = self.fc1(x)
+        return x
+
+
+class IdentityExpandModel(nn.Module):
+    """Model that only adds an empty dimension at axis 0.
+
+    This model is mostly useful for testing the composition feature.
+    """
+
+    def forward(self, x):  # pylint: disable-next=no-self-use
+        """Forward pass.
+
+        Args:
+            x (torch.Tensor): The input of the model.
+
+        Returns:
+            Tuple[torch.Tensor. torch.Tensor]: Outputs of the network.
+        """
+        return x.unsqueeze(0)
+
+
+class IdentityExpandMultiOutputModel(nn.Module):
+    """Model that only adds an empty dimension at axis 0, and returns the initial input as well.
+
+    This model is mostly useful for testing the composition feature.
+    """
+
+    def forward(self, x):  # pylint: disable-next=no-self-use
+        """Forward pass.
+
+        Args:
+            x (torch.Tensor): The input of the model.
+
+        Returns:
+            Tuple[torch.Tensor. torch.Tensor]: Outputs of the network.
+        """
+        return x, x.unsqueeze(0)

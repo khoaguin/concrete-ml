@@ -1,4 +1,5 @@
 """Implement sklearn's Generalized Linear Models (GLM)."""
+
 from __future__ import annotations
 
 from abc import abstractmethod
@@ -324,7 +325,6 @@ class TweedieRegressor(_GeneralizedLinearRegressor):
         # Scikit-Learn
         metadata["alpha"] = self.alpha
         metadata["fit_intercept"] = self.fit_intercept
-        metadata["solver"] = self.solver
         metadata["max_iter"] = self.max_iter
         metadata["tol"] = self.tol
         metadata["warm_start"] = self.warm_start
@@ -355,7 +355,6 @@ class TweedieRegressor(_GeneralizedLinearRegressor):
         # Scikit-Learn
         obj.alpha = metadata["alpha"]
         obj.fit_intercept = metadata["fit_intercept"]
-        obj.solver = metadata["solver"]
         obj.max_iter = metadata["max_iter"]
         obj.tol = metadata["tol"]
         obj.warm_start = metadata["warm_start"]

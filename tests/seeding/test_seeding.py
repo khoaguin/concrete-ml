@@ -1,14 +1,13 @@
 """Tests for the torch to numpy module."""
+
 import inspect
 import random
-import warnings
 
 import numpy
 import pytest
-from sklearn.exceptions import ConvergenceWarning
 from sklearn.tree import plot_tree
 
-from concrete.ml.pytest.utils import sklearn_models_and_datasets
+from concrete.ml.pytest.utils import MODELS_AND_DATASETS
 
 
 def test_seed_1():
@@ -79,7 +78,7 @@ def test_seed_needing_randomly_seed_arg_3(random_inputs_1, random_inputs_2, rand
     print("Random inputs", random_inputs_3)
 
 
-@pytest.mark.parametrize("model_class, parameters", sklearn_models_and_datasets)
+@pytest.mark.parametrize("model_class, parameters", MODELS_AND_DATASETS)
 def test_seed_sklearn(model_class, parameters, load_data, default_configuration):
     """Test seeding of sklearn models"""
 
@@ -87,16 +86,14 @@ def test_seed_sklearn(model_class, parameters, load_data, default_configuration)
 
     # Force "random_state": if it was there, it is overwritten; if it was not there, it is added
     model_params = {}
-    if "random_state" in inspect.getfullargspec(model_class).args:
+    if "random_state" in inspect.signature(model_class).parameters:
         model_params["random_state"] = numpy.random.randint(0, 2**15)
 
     # First case: user gives his own random_state
     model = model_class(**model_params)
 
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", category=ConvergenceWarning)
-        # Fit the model
-        model, sklearn_model = model.fit_benchmark(x, y)
+    # Fit the model
+    model, sklearn_model = model.fit_benchmark(x, y)
 
     lpvoid_ptr_plot_tree = getattr(model, "plot_tree", None)
     if callable(lpvoid_ptr_plot_tree):

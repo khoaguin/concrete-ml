@@ -74,6 +74,7 @@ REGRESSORS_NAMES = [
     "NeuralNetRegressor",
     "RandomForestRegressor",
     "XGBRegressor",
+    "SGDRegressor",
 ]
 for model_name in REGRESSORS_NAMES:
     try:
@@ -236,7 +237,6 @@ DATASET_VERSIONS = {
 
 
 # This is only for benchmarks to speed up compilation times
-# Jit compiler is now deprecated and will soon be removed, it is thus forced to False by default
 # Parameter `enable_unsafe_features` and `use_insecure_key_cache` are needed in order to be able to
 # cache generated keys through `insecure_key_cache_location`. As the name suggests, these
 # parameters are unsafe and should only be used for debugging in development
@@ -244,8 +244,7 @@ BENCHMARK_CONFIGURATION = fhe.Configuration(
     dump_artifacts_on_unexpected_failures=True,
     enable_unsafe_features=True,
     use_insecure_key_cache=True,
-    insecure_key_cache_location="ConcreteNumpyKeyCache",
-    jit=False,
+    insecure_key_cache_location="ConcretePythonKeyCache",
 )
 
 
@@ -274,7 +273,7 @@ def run_and_report_classification_metrics(
             (f1_score, "f1", "F1Score"),
         ]
 
-    for (metric, metric_id, metric_label) in metric_info:
+    for metric, metric_id, metric_label in metric_info:
         run_and_report_metric(
             y_gt,
             y_pred,
@@ -288,7 +287,7 @@ def run_and_report_regression_metrics(y_gt, y_pred, metric_id_prefix, metric_lab
     """Run several metrics and report results to progress tracker with computed name and id"""
 
     metric_info = [(r2_score, "r2_score", "R2Score"), (mean_squared_error, "MSE", "MSE")]
-    for (metric, metric_id, metric_label) in metric_info:
+    for metric, metric_id, metric_label in metric_info:
         run_and_report_metric(
             y_gt,
             y_pred,
@@ -341,6 +340,7 @@ def should_test_config_in_fhe(
         "TweedieRegressor",
         "PoissonRegressor",
         "GammaRegressor",
+        "SGDRegressor",
     }:
         return True
 
@@ -766,6 +766,7 @@ def benchmark_name_generator(
 # - Bijection between both functions
 # - The functions support all models
 # FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/1866
+
 
 # pylint: disable-next=too-many-branches, redefined-outer-name
 def benchmark_name_to_config(
